@@ -12,8 +12,9 @@ import pandas as pd
 from loguru import logger
 
 from .data import (
-    HatEvalLoader,
-    LatentHatredLoader,
+    HateXplainLoader,
+    ImplicitHateLoader,
+    NonHateLoader,
     SemEvalSarcasmLoader,
     ISarcasmLoader,
     SapDialectalLoader,
@@ -225,29 +226,43 @@ class EmpiricalStudyPipeline:
 
     def load_hate_speech_data(self) -> Dict[str, List[Sample]]:
         """
-        Load hate speech datasets (HatEval and LatentHatred).
+        Load hate speech datasets (HateXplain for explicit, ImplicitHate for implicit).
 
         Returns BALANCED samples with both hate and non-hate examples.
+
+        Datasets:
+        - Explicit: HateXplain (GitHub hate-alert/HateXplain) - clear slurs/threats
+        - Implicit: ImplicitHate (SALT-NLP/implicit-hate) - subtle hate without markers
         """
         logger.info("Loading hate speech data...")
 
         config = self.config["data"]["hate_speech"]
 
-        # Load explicit hate speech from HatEval
-        hateval_loader = HatEvalLoader(cache_dir=str(self.cache_dir))
-        hateval_samples = hateval_loader.load()
+        # Load explicit hate speech from HateXplain
+        # HateXplain already has both hate and non-hate samples
+        logger.info("Loading explicit hate from HateXplain...")
+        hatexplain_loader = HateXplainLoader(cache_dir=str(self.cache_dir))
+        hatexplain_samples = hatexplain_loader.load()
 
-        # FIXED: Get balanced sample (both positive and negative)
-        explicit = self._balanced_sample(hateval_samples, config["explicit"])
+        # Get balanced sample (both positive and negative)
+        explicit = self._balanced_sample(hatexplain_samples, config["explicit"])
         for s in explicit:
             s.content_type = "explicit"
 
-        # Load implicit hate speech from LatentHatred
-        latent_loader = LatentHatredLoader(cache_dir=str(self.cache_dir))
-        latent_samples = latent_loader.load()
+        # Load implicit hate speech from ImplicitHate
+        # ImplicitHate only contains hate samples (label=1), need to add non-hate
+        logger.info("Loading implicit hate from ImplicitHate corpus...")
+        implicit_loader = ImplicitHateLoader(cache_dir=str(self.cache_dir))
+        implicit_hate_samples = implicit_loader.load()
 
-        # FIXED: Get balanced sample (both positive and negative)
-        implicit = self._balanced_sample(latent_samples, config["implicit"])
+        # Load non-hate samples from Davidson dataset for balancing
+        logger.info("Loading non-hate samples from Davidson corpus for balancing...")
+        nonhate_loader = NonHateLoader(cache_dir=str(self.cache_dir))
+        nonhate_samples = nonhate_loader.load()
+
+        # Combine implicit hate + non-hate samples, then balance
+        implicit_combined = implicit_hate_samples + nonhate_samples
+        implicit = self._balanced_sample(implicit_combined, config["implicit"])
         for s in implicit:
             s.content_type = "implicit"
 
@@ -257,8 +272,8 @@ class EmpiricalStudyPipeline:
         imp_pos = sum(1 for s in implicit if s.label == 1)
         imp_neg = sum(1 for s in implicit if s.label == 0)
 
-        logger.info(f"Explicit: {exp_pos} hate + {exp_neg} non-hate = {len(explicit)}")
-        logger.info(f"Implicit: {imp_pos} hate + {imp_neg} non-hate = {len(implicit)}")
+        logger.info(f"Explicit (HateXplain): {exp_pos} hate + {exp_neg} non-hate = {len(explicit)}")
+        logger.info(f"Implicit (ImplicitHate+Davidson): {imp_pos} hate + {imp_neg} non-hate = {len(implicit)}")
 
         return {"explicit": explicit, "implicit": implicit}
 
