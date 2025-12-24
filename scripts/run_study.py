@@ -3,8 +3,19 @@
 Main entry point for running the empirical study.
 
 Usage:
-    python scripts/run_study.py --config configs/config.yaml --output-dir results/
-    python scripts/run_study.py --quick  # Run with reduced samples for testing
+    # Run all studies
+    python scripts/run_study.py --output-dir results/
+
+    # Run individual studies
+    python scripts/run_study.py --study 1  # Hate speech: explicit vs implicit
+    python scripts/run_study.py --study 2  # Sarcasm with translation
+    python scripts/run_study.py --study 3  # Dialectal bias (AAE vs SAE)
+
+    # Run Study 2 with different target language
+    python scripts/run_study.py --study 2 --target-lang nl
+
+    # Quick test with reduced samples
+    python scripts/run_study.py --quick
 """
 
 import argparse
@@ -16,9 +27,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from loguru import logger
-
-from empirical_study.pipeline import EmpiricalStudyPipeline
-from empirical_study.analysis.visualizations import create_all_figures, create_latex_tables
 
 
 def setup_logging(log_dir: str = "./logs"):
@@ -61,9 +69,44 @@ def check_environment():
     return len(warnings) == 0
 
 
+def print_study_info():
+    """Print information about available studies."""
+    info = """
+╔══════════════════════════════════════════════════════════════════╗
+║                    EMPIRICAL STUDY OPTIONS                       ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║  Study 1: Hate Speech Detection by Content Type                 ║
+║  --study 1 or --study hate_speech                                ║
+║  Compares explicit (clear slurs) vs implicit (subtle) hate       ║
+║                                                                  ║
+║  Study 2: Sarcasm Detection with Translation                    ║
+║  --study 2 or --study sarcasm                                    ║
+║  Measures sarcasm preservation through machine translation       ║
+║  Use --target-lang to specify: es (Spanish), nl (Dutch), it     ║
+║                                                                  ║
+║  Study 3: Dialectal Bias                                        ║
+║  --study 3 or --study dialectal                                  ║
+║  Measures FPR differences between AAE and SAE                    ║
+║                                                                  ║
+║  Run All: --study all (default)                                  ║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+    print(info)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Run Empirical Study on Hate Speech and Sarcasm Detection"
+        description="Run Empirical Study on Hate Speech and Sarcasm Detection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python scripts/run_study.py --study 1              # Run hate speech study
+  python scripts/run_study.py --study 2 --target-lang es  # Sarcasm with Spanish
+  python scripts/run_study.py --study 3              # Run dialectal bias study
+  python scripts/run_study.py --study all            # Run all studies
+        """
     )
     parser.add_argument(
         "--config",
@@ -91,29 +134,28 @@ def main():
         help="Device to use for inference",
     )
     parser.add_argument(
+        "--study",
+        type=str,
+        default="all",
+        choices=["all", "1", "2", "3", "hate_speech", "sarcasm", "dialectal"],
+        help="Which study to run",
+    )
+    parser.add_argument(
+        "--target-lang",
+        type=str,
+        default="es",
+        choices=["es", "nl", "it"],
+        help="Target language for Study 2 (sarcasm translation)",
+    )
+    parser.add_argument(
         "--quick",
         action="store_true",
         help="Run with reduced samples for quick testing",
     )
     parser.add_argument(
-        "--skip-translation",
+        "--info",
         action="store_true",
-        help="Skip translation experiments",
-    )
-    parser.add_argument(
-        "--skip-gpt4",
-        action="store_true",
-        help="Skip GPT-4 evaluation even if API key is available",
-    )
-    parser.add_argument(
-        "--create-figures",
-        action="store_true",
-        help="Generate visualization figures",
-    )
-    parser.add_argument(
-        "--create-tables",
-        action="store_true",
-        help="Generate LaTeX tables",
+        help="Print information about available studies",
     )
     parser.add_argument(
         "--log-dir",
@@ -124,8 +166,16 @@ def main():
 
     args = parser.parse_args()
 
+    # Print info and exit if requested
+    if args.info:
+        print_study_info()
+        return 0
+
     # Setup
     setup_logging(args.log_dir)
+
+    print_study_info()
+
     logger.info("=" * 60)
     logger.info("Empirical Study on Hate Speech and Sarcasm Detection")
     logger.info("=" * 60)
@@ -133,47 +183,69 @@ def main():
     # Check environment
     check_environment()
 
-    # Handle quick mode
+    # Import here to avoid slow startup when just checking --help
+    from empirical_study.pipeline import EmpiricalStudyPipeline
+
+    # Handle quick mode - modify config
+    config_override = None
     if args.quick:
-        logger.info("Running in quick mode with reduced samples")
-        # Override config for quick testing
-        os.environ["EMPIRICAL_STUDY_QUICK_MODE"] = "1"
+        logger.info("Running in QUICK MODE with reduced samples")
+        config_override = {
+            "data": {
+                "hate_speech": {"explicit": 20, "implicit": 20},
+                "sarcasm": {"clear": 20, "subtle": 20},
+                "dialectal": {"aae": 20},
+            },
+            "translation": {
+                "target_languages": [args.target_lang],
+                "systems": ["nllb"],  # Only use local model for quick test
+            },
+            "evaluation": {
+                "bootstrap": {"n_resamples": 100, "confidence_level": 0.95},
+            },
+        }
 
-    # Handle skip flags
-    if args.skip_gpt4:
-        # Temporarily unset API key to skip GPT-4
-        os.environ.pop("OPENAI_API_KEY", None)
-
-    # Create and run pipeline
+    # Create pipeline
     pipeline = EmpiricalStudyPipeline(
-        config_path=args.config,
+        config_path=args.config if not args.quick else None,
         output_dir=args.output_dir,
         cache_dir=args.cache_dir,
         device=args.device,
     )
 
-    results = pipeline.run_full_study()
+    # Override config if quick mode
+    if config_override:
+        pipeline.config = config_override
 
-    # Create figures if requested
-    if args.create_figures:
-        figures_dir = Path(args.output_dir) / "figures"
-        create_all_figures(results, str(figures_dir))
+    # Run selected study
+    logger.info(f"Running study: {args.study}")
 
-    # Create tables if requested
-    if args.create_tables:
-        tables_dir = Path(args.output_dir) / "tables"
-        create_latex_tables(results, str(tables_dir))
+    if args.study == "all":
+        results = pipeline.run_full_study()
+    elif args.study in ["1", "hate_speech"]:
+        results = {"study1_hate_speech": pipeline.run_study_1_hate_speech_content_type()}
+    elif args.study in ["2", "sarcasm"]:
+        results = {f"study2_sarcasm_{args.target_lang}": pipeline.run_study_2_sarcasm_translation(args.target_lang)}
+    elif args.study in ["3", "dialectal"]:
+        results = {"study3_dialectal": pipeline.run_study_3_dialectal_bias()}
+    else:
+        results = pipeline.run_full_study()
 
     # Print summary
     print("\n" + "=" * 60)
-    print("Study Complete!")
+    print("RESULTS SUMMARY")
     print("=" * 60)
-    print(f"\nResults saved to: {args.output_dir}")
 
     for name, df in results.items():
         if df is not None and not df.empty:
             print(f"\n{name}:")
-            print(df.head().to_string())
+            print("-" * 40)
+            print(df.to_string())
+
+    print("\n" + "=" * 60)
+    print(f"Results saved to: {args.output_dir}")
+    print(f"Sample files saved to: {args.output_dir}/samples/")
+    print("=" * 60)
 
     return 0
 
