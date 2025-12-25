@@ -11,8 +11,12 @@ This tests the hypothesis that models trained on explicit hate
 struggle with implicit hate, and vice versa.
 """
 
-import json
+# Disable TensorFlow to avoid Keras 3 conflicts with transformers
 import os
+os.environ["USE_TF"] = "0"
+os.environ["USE_TORCH"] = "1"
+
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
