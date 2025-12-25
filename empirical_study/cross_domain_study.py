@@ -20,8 +20,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import torch
-from torch.utils.data import Dataset, DataLoader
 from loguru import logger
 from sklearn.metrics import (
     accuracy_score,
@@ -29,19 +27,15 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-# Check for transformers
+# Delay transformers import to avoid TensorFlow/Keras conflicts
+HAS_TRANSFORMERS = False
+HAS_TORCH = False
+
 try:
-    from transformers import (
-        AutoModelForSequenceClassification,
-        AutoTokenizer,
-        TrainingArguments,
-        Trainer,
-        EarlyStoppingCallback,
-    )
-    HAS_TRANSFORMERS = True
+    import torch
+    HAS_TORCH = True
 except ImportError:
-    HAS_TRANSFORMERS = False
-    logger.warning("transformers not installed. Install with: pip install transformers")
+    logger.warning("PyTorch not installed. Install with: pip install torch")
 
 from .data import HateXplainLoader, SBICLoader
 from .data.dataset_loader import Sample
@@ -82,36 +76,42 @@ class CrossDomainResult:
         }
 
 
-class HateSpeechDataset(Dataset):
-    """PyTorch Dataset for hate speech samples."""
+def create_dataset_class():
+    """Create HateSpeechDataset class with torch imports."""
+    from torch.utils.data import Dataset
 
-    def __init__(
-        self,
-        samples: List[Sample],
-        tokenizer,
-        max_length: int = 128,
-    ):
-        self.samples = samples
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+    class HateSpeechDataset(Dataset):
+        """PyTorch Dataset for hate speech samples."""
 
-    def __len__(self):
-        return len(self.samples)
+        def __init__(
+            self,
+            samples: List[Sample],
+            tokenizer,
+            max_length: int = 128,
+        ):
+            self.samples = samples
+            self.tokenizer = tokenizer
+            self.max_length = max_length
 
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        encoding = self.tokenizer(
-            sample.text,
-            truncation=True,
-            padding="max_length",
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        return {
-            "input_ids": encoding["input_ids"].squeeze(),
-            "attention_mask": encoding["attention_mask"].squeeze(),
-            "labels": torch.tensor(sample.label, dtype=torch.long),
-        }
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            sample = self.samples[idx]
+            encoding = self.tokenizer(
+                sample.text,
+                truncation=True,
+                padding="max_length",
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            return {
+                "input_ids": encoding["input_ids"].squeeze(),
+                "attention_mask": encoding["attention_mask"].squeeze(),
+                "labels": torch.tensor(sample.label, dtype=torch.long),
+            }
+
+    return HateSpeechDataset
 
 
 class CrossDomainStudy:
@@ -255,8 +255,21 @@ class CrossDomainStudy:
     ) -> List[CrossDomainResult]:
         """Fine-tune a model and evaluate on multiple test sets."""
 
-        if not HAS_TRANSFORMERS:
-            logger.error("transformers library not installed")
+        # Import transformers here to avoid TensorFlow/Keras conflicts at module load
+        try:
+            from transformers import (
+                AutoModelForSequenceClassification,
+                AutoTokenizer,
+                TrainingArguments,
+                Trainer,
+            )
+        except ImportError as e:
+            logger.error(f"transformers library not installed or import error: {e}")
+            logger.error("Install with: pip install transformers torch")
+            return []
+
+        if not HAS_TORCH:
+            logger.error("PyTorch not installed. Install with: pip install torch")
             return []
 
         model_path = self.MODELS.get(model_type, model_type)
@@ -268,6 +281,9 @@ class CrossDomainStudy:
             model_path,
             num_labels=2,
         )
+
+        # Create dataset class (delayed import for torch)
+        HateSpeechDataset = create_dataset_class()
 
         # Create training dataset
         train_dataset = HateSpeechDataset(train_samples, tokenizer)
