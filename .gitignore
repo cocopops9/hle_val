@@ -4,10 +4,10 @@ __pycache__/
 *$py.class
 *.so
 
-# Data and cache directories
-data/
-logs/
-results/
+# Data and cache directories (top-level only)
+/data/
+/logs/
+/results/
 *.log
 
 # Virtual environments

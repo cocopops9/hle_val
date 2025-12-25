@@ -398,6 +398,168 @@ class ImplicitHateLoader(DatasetLoader):
         return samples
 
 
+class SBICLoader(DatasetLoader):
+    """
+    Loader for Social Bias Inference Corpus (SBIC).
+
+    SBIC contains posts with annotated implied stereotypes and biases.
+    This is truly IMPLICIT hate - offensive content that implies stereotypes
+    without using explicit slurs.
+
+    Reference: Sap et al. (2020). Social Bias Frames: Reasoning about
+    Social and Power Implications of Language. ACL 2020.
+
+    Data source: https://maartensap.com/social-bias-frames/
+    """
+
+    # Words to filter out for truly implicit samples
+    EXPLICIT_WORDS = [
+        'nigger', 'nigga', 'niglet', 'faggot', 'fag', 'kike', 'spic', 'chink',
+        'cunt', 'bitch', 'hoe', 'hoes', 'retard', 'tranny', 'dyke', 'whore',
+        'wetback', 'beaner', 'gook', 'jap', 'cracker'
+    ]
+
+    def __init__(
+        self,
+        cache_dir: str = "./data/cache",
+        split: str = "train",
+        implicit_only: bool = True,  # Filter out posts with explicit slurs
+        min_offensive_score: float = 0.5,  # Minimum offensiveYN score
+    ):
+        super().__init__(cache_dir)
+        self.split = split
+        self.implicit_only = implicit_only
+        self.min_offensive_score = min_offensive_score
+        self.data_path = self.cache_dir / "sbic"
+        self.data_path.mkdir(parents=True, exist_ok=True)
+
+    def get_dataset_name(self) -> str:
+        return "SBIC"
+
+    def _has_explicit_words(self, text: str) -> bool:
+        """Check if text contains explicit slurs."""
+        if pd.isna(text):
+            return False
+        text_lower = str(text).lower()
+        return any(word in text_lower for word in self.EXPLICIT_WORDS)
+
+    def _download_data(self) -> bool:
+        """Download SBIC data if not present."""
+        import urllib.request
+        import tarfile
+
+        tgz_path = self.data_path / "SBIC.v2.tgz"
+        train_path = self.data_path / "SBIC.v2.trn.csv"
+
+        if train_path.exists():
+            return True
+
+        try:
+            logger.info("Downloading SBIC dataset...")
+            url = "https://maartensap.com/social-bias-frames/SBIC.v2.tgz"
+            urllib.request.urlretrieve(url, tgz_path)
+
+            logger.info("Extracting SBIC dataset...")
+            with tarfile.open(tgz_path, "r:gz") as tar:
+                tar.extractall(self.data_path)
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to download SBIC: {e}")
+            return False
+
+    def load(self) -> List[Sample]:
+        """Load SBIC dataset."""
+        logger.info(f"Loading SBIC dataset ({self.split} split)...")
+
+        # Ensure data is downloaded
+        if not self._download_data():
+            self.samples = []
+            return self.samples
+
+        # Map split names to file names
+        split_files = {
+            "train": "SBIC.v2.trn.csv",
+            "dev": "SBIC.v2.dev.csv",
+            "val": "SBIC.v2.dev.csv",
+            "test": "SBIC.v2.tst.csv",
+        }
+
+        file_name = split_files.get(self.split, "SBIC.v2.trn.csv")
+        file_path = self.data_path / file_name
+
+        if not file_path.exists():
+            logger.error(f"SBIC file not found: {file_path}")
+            self.samples = []
+            return self.samples
+
+        # Load CSV
+        df = pd.read_csv(file_path)
+        logger.info(f"Loaded {len(df)} raw annotations")
+
+        # Filter for offensive posts with stereotypes (implicit hate)
+        hate_df = df[
+            (df['offensiveYN'] >= self.min_offensive_score) &
+            df['targetStereotype'].notna() &
+            (df['targetStereotype'] != '')
+        ]
+
+        # Filter out explicit slurs if requested
+        if self.implicit_only:
+            hate_df = hate_df[~hate_df['post'].apply(self._has_explicit_words)]
+
+        # Get non-hate samples (not offensive)
+        nonhate_df = df[df['offensiveYN'] == 0.0]
+
+        # Deduplicate by post text
+        hate_unique = hate_df.drop_duplicates(subset=['post'])
+        nonhate_unique = nonhate_df.drop_duplicates(subset=['post'])
+
+        logger.info(f"Unique implicit hate posts: {len(hate_unique)}")
+        logger.info(f"Unique non-hate posts: {len(nonhate_unique)}")
+
+        samples = []
+
+        # Add hate samples (label=1)
+        for idx, row in hate_unique.iterrows():
+            sample = Sample(
+                text=str(row['post']),
+                label=1,
+                sample_id=f"sbic_hate_{idx}",
+                source_dataset="SBIC",
+                content_type="implicit",
+                metadata={
+                    "target_minority": str(row.get('targetMinority', '')),
+                    "target_stereotype": str(row.get('targetStereotype', '')),
+                    "offensive_score": float(row.get('offensiveYN', 0)),
+                },
+            )
+            samples.append(sample)
+
+        # Add non-hate samples (label=0)
+        for idx, row in nonhate_unique.iterrows():
+            sample = Sample(
+                text=str(row['post']),
+                label=0,
+                sample_id=f"sbic_nonhate_{idx}",
+                source_dataset="SBIC",
+                content_type="implicit",
+                metadata={
+                    "offensive_score": 0.0,
+                },
+            )
+            samples.append(sample)
+
+        self.samples = samples
+
+        # Log distribution
+        pos = sum(1 for s in samples if s.label == 1)
+        neg = sum(1 for s in samples if s.label == 0)
+        logger.info(f"SBIC loaded: {pos} implicit hate + {neg} non-hate = {len(samples)}")
+
+        return samples
+
+
 class NonHateLoader(DatasetLoader):
     """
     Loader for non-hate speech samples to balance the dataset.
