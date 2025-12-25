@@ -128,7 +128,7 @@ class CrossDomainStudy:
 
     # Available models for fine-tuning
     MODELS = {
-        "bert": "bert-base-uncased",
+        "bert": "bert-base-cased",
         "roberta": "roberta-base",
         "distilbert": "distilbert-base-uncased",
     }
@@ -255,7 +255,7 @@ class CrossDomainStudy:
         train_dataset_name: str,
         num_epochs: int = 3,
         batch_size: int = 16,
-        learning_rate: float = 2e-5,
+        learning_rate: float = 1e-5,
     ) -> List[CrossDomainResult]:
         """Fine-tune a model and evaluate on multiple test sets."""
 
