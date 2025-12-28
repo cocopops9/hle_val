@@ -376,7 +376,11 @@ class GraduatedTrainer:
         all_labels = [s.label for s in primary_samples + secondary_samples]
         class_counts = [all_labels.count(0), all_labels.count(1)]
         total = sum(class_counts)
-        alpha = torch.tensor([total / (2 * c) for c in class_counts]).to(self.device)
+        alpha = torch.tensor([total / (2 * c) if c > 0 else 1.0 for c in class_counts]).to(self.device)
+
+        logger.info(f"Total training samples: {len(primary_samples)} primary + {len(secondary_samples)} secondary")
+        logger.info(f"Class distribution: {class_counts[0]} non-hateful, {class_counts[1]} hateful")
+        logger.info(f"Focal Loss: gamma={self.gamma}, alpha={alpha.tolist()}")
 
         focal_loss = FocalLoss(alpha=alpha, gamma=self.gamma)
         contrastive_loss = ContrastiveLoss(temperature=self.temperature)
@@ -426,6 +430,15 @@ class GraduatedTrainer:
 
             if not epoch_samples:
                 continue
+
+            # Log epoch class distribution
+            epoch_hateful = sum(1 for s in epoch_samples if s.label == 1)
+            epoch_nonhateful = sum(1 for s in epoch_samples if s.label == 0)
+            logger.info(
+                f"  Epoch samples: {len(epoch_samples)} total, "
+                f"{epoch_hateful} hateful ({100*epoch_hateful/len(epoch_samples):.1f}%), "
+                f"{epoch_nonhateful} non-hateful ({100*epoch_nonhateful/len(epoch_samples):.1f}%)"
+            )
 
             train_dataset = HateSpeechDataset(epoch_samples, self.tokenizer)
             train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -552,26 +565,39 @@ class FunctionalValidationStudy:
         positive = [s for s in samples if s.label == 1]
         negative = [s for s in samples if s.label == 0]
 
+        logger.info(f"  Source distribution: {len(positive)} hateful, {len(negative)} non-hateful")
+
         n_per_class = n_total // 2
 
+        # Sample or use all available (with warning if not enough)
         if len(positive) >= n_per_class:
             idx = np.random.choice(len(positive), n_per_class, replace=False)
             positive = [positive[i] for i in idx]
+        else:
+            logger.warning(f"  Only {len(positive)} hateful samples available (wanted {n_per_class})")
 
         if len(negative) >= n_per_class:
             idx = np.random.choice(len(negative), n_per_class, replace=False)
             negative = [negative[i] for i in idx]
+        else:
+            logger.warning(f"  Only {len(negative)} non-hateful samples available (wanted {n_per_class})")
 
         combined = positive + negative
         np.random.shuffle(combined)
+
+        # Log final distribution
+        final_pos = sum(1 for s in combined if s.label == 1)
+        final_neg = sum(1 for s in combined if s.label == 0)
+        logger.info(f"  Final training distribution: {final_pos} hateful, {final_neg} non-hateful")
+
         return combined
 
     def load_training_data(self) -> Dict[str, List[Sample]]:
         """Load HateXplain and SBIC training data."""
         logger.info("Loading training datasets...")
 
-        # HateXplain (explicit hate)
-        hx_loader = HateXplainLoader(cache_dir=str(self.cache_dir))
+        # HateXplain (explicit hate) - use TRAIN split for training
+        hx_loader = HateXplainLoader(cache_dir=str(self.cache_dir), split="train")
         hx_samples = hx_loader.load()
         hx_train = self._balanced_sample(hx_samples, self.n_train_samples)
 
