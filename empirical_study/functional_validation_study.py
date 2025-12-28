@@ -516,7 +516,7 @@ class FunctionalValidationStudy:
         output_dir: str = "./results/functional_validation",
         cache_dir: str = "./data/cache",
         device: Optional[str] = None,
-        n_train_samples: int = 2000,
+        n_train_samples: int = 6000,
         random_seed: int = 42,
     ):
         self.output_dir = Path(output_dir)
