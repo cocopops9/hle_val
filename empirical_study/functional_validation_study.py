@@ -882,12 +882,13 @@ class FunctionalValidationStudy:
         model_type: str = "electra",
         num_epochs: int = 3,
         batch_size: int = 16,
-        gamma_values: List[float] = [1.0, 2.0, 3.0],
+        gamma_values: List[float] = [0.0, 0.5, 1.0, 2.0],
     ) -> Tuple[float, pd.DataFrame]:
         """
         Phase 3 Step 1: Focal loss gamma tuning.
 
-        Evaluate γ ∈ {1, 2, 3} on class imbalance tests (F9, F15).
+        Evaluate γ ∈ {0, 0.5, 1, 2} on class imbalance tests (F9, F15).
+        γ=0 is equivalent to standard cross-entropy.
         Returns optimal gamma and results DataFrame.
         """
         logger.info("=" * 60)
@@ -913,11 +914,19 @@ class FunctionalValidationStudy:
             tokenizer = AutoTokenizer.from_pretrained(model_path)
             model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=2)
 
-            trainer = FocalLossTrainer(model, tokenizer, self.device, gamma=gamma)
+            # Use GraduatedTrainer with multi-dataset to match final training
+            trainer = GraduatedTrainer(
+                model, tokenizer, self.device,
+                gamma=gamma,
+                lambda_con=0.0,  # No contrastive loss during gamma tuning
+            )
             trainer.train(
-                train_data["hatexplain"],
+                primary_samples=train_data["hatexplain"],
+                secondary_samples=train_data["sbic"],
                 num_epochs=num_epochs,
                 batch_size=batch_size,
+                initial_secondary_weight=0.2,  # 80/20 mixing
+                constant_mixing=True,
             )
 
             # Evaluate on HateCheck
@@ -941,30 +950,45 @@ class FunctionalValidationStudy:
                 )
                 test_results.append(result)
 
-            # Compute class imbalance accuracy
-            ci_results = [r for r in test_results if r.test_id in class_imbalance_tests]
-            ci_accuracy = np.mean([r.accuracy for r in ci_results]) if ci_results else 0
+            # Compute hateful/non-hateful accuracy
+            hateful_results = [r for r in test_results if r.hateful_expected is True]
+            nonhateful_results = [r for r in test_results if r.hateful_expected is False]
+
+            hateful_acc = np.mean([r.accuracy for r in hateful_results]) if hateful_results else 0
+            nonhateful_acc = np.mean([r.accuracy for r in nonhateful_results]) if nonhateful_results else 0
+
+            # Use harmonic mean for balanced metric (penalizes imbalance)
+            if hateful_acc > 0 and nonhateful_acc > 0:
+                balanced_acc = 2 * hateful_acc * nonhateful_acc / (hateful_acc + nonhateful_acc)
+            else:
+                balanced_acc = 0
 
             # Overall metrics
             all_accuracy = np.mean([r.accuracy for r in test_results])
 
             gamma_results.append({
                 "gamma": gamma,
-                "class_imbalance_acc": ci_accuracy,
+                "hateful_acc": hateful_acc,
+                "nonhateful_acc": nonhateful_acc,
+                "balanced_acc": balanced_acc,
                 "overall_acc": all_accuracy,
             })
 
-            logger.info(f"γ={gamma}: class_imbalance={ci_accuracy:.3f}, overall={all_accuracy:.3f}")
+            logger.info(
+                f"γ={gamma}: hateful={hateful_acc:.3f}, non-hateful={nonhateful_acc:.3f}, "
+                f"balanced={balanced_acc:.3f}, overall={all_accuracy:.3f}"
+            )
 
-            if ci_accuracy > best_acc:
-                best_acc = ci_accuracy
+            # Select gamma with best balanced accuracy
+            if balanced_acc > best_acc:
+                best_acc = balanced_acc
                 best_gamma = gamma
 
             del model, trainer
             if HAS_TORCH:
                 torch.cuda.empty_cache()
 
-        logger.info(f"\nOptimal γ* = {best_gamma} (class_imbalance_acc = {best_acc:.3f})")
+        logger.info(f"\nOptimal γ* = {best_gamma} (balanced_acc = {best_acc:.3f})")
 
         df = pd.DataFrame(gamma_results)
         self._save_results(df, "phase3_step1_gamma")
