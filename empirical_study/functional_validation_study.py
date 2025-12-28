@@ -503,11 +503,12 @@ class FunctionalValidationStudy:
     }
 
     # Target functional tests by data limitation
+    # Using actual HateCheck functionality names (not F# codes)
     TARGET_TESTS = {
-        "class_imbalance": ["F9", "F15"],
-        "identity_bias": ["F18", "F19"],
-        "domain_specificity": ["F20", "F21"],
-        "lexical_coverage": ["F25", "F26", "F27", "F28", "F29"],
+        "class_imbalance": ["slur_reclaimed_nh", "negate_neg_nh"],  # F9, F15
+        "identity_bias": ["ident_neutral_nh", "ident_pos_nh"],  # F18, F19
+        "domain_specificity": ["counter_quote_nh", "counter_ref_nh"],  # F20, F21
+        "lexical_coverage": ["spell_space_add_h", "spell_space_del_h", "spell_char_swap_h", "spell_char_del_h", "spell_leet_h"],  # F25-F29
     }
 
     def __init__(
@@ -1046,7 +1047,8 @@ class FunctionalValidationStudy:
         hatecheck_samples = self.load_hatecheck()
 
         # Target tests for contrastive discrimination
-        confusable_tests = ["F9", "F15", "F20", "F21"]
+        # Using actual HateCheck functionality names
+        confusable_tests = ["slur_reclaimed_nh", "negate_neg_nh", "counter_quote_nh", "counter_ref_nh"]
 
         lambda_results = []
         best_lambda = lambda_con_values[0]

@@ -21,59 +21,60 @@ from .dataset_loader import DatasetLoader, Sample
 
 
 # HateCheck functional test definitions
+# Using actual functionality names from the dataset
 FUNCTIONAL_TESTS = {
-    # Hateful content tests (F1-F7)
-    "F1": {"name": "Expression of strong negative emotions", "hateful": True},
-    "F2": {"name": "Description using very negative attributes", "hateful": True},
-    "F3": {"name": "Dehumanisation", "hateful": True},
-    "F4": {"name": "Implicit derogation", "hateful": True},
-    "F5": {"name": "Direct threat", "hateful": True},
-    "F6": {"name": "Threat as normative statement", "hateful": True},
-    "F7": {"name": "Hate expressed using slur", "hateful": True},
+    # Hateful content tests
+    "derog_neg_emote_h": {"name": "Expression of strong negative emotions", "hateful": True},
+    "derog_neg_attrib_h": {"name": "Description using very negative attributes", "hateful": True},
+    "derog_dehum_h": {"name": "Dehumanisation", "hateful": True},
+    "derog_impl_h": {"name": "Implicit derogation", "hateful": True},
+    "threat_dir_h": {"name": "Direct threat", "hateful": True},
+    "threat_norm_h": {"name": "Threat as normative statement", "hateful": True},
+    "slur_h": {"name": "Hate expressed using slur", "hateful": True},
 
-    # Non-hateful with slurs (F8-F11)
-    "F8": {"name": "Non-hateful homonyms of slurs", "hateful": False},
-    "F9": {"name": "Reclaimed slurs", "hateful": False},
-    "F10": {"name": "Discussion of hate targeting protected group", "hateful": False},
-    "F11": {"name": "Non-hate expressed using slur", "hateful": False},
+    # Non-hateful with slurs
+    "slur_homonym_nh": {"name": "Non-hateful homonyms of slurs", "hateful": False},
+    "slur_reclaimed_nh": {"name": "Reclaimed slurs", "hateful": False},
 
-    # Profanity (F12-F13)
-    "F12": {"name": "Hate expressed using profanity", "hateful": True},
-    "F13": {"name": "Non-hateful use of profanity", "hateful": False},
+    # Profanity
+    "profanity_h": {"name": "Hate expressed using profanity", "hateful": True},
+    "profanity_nh": {"name": "Non-hateful use of profanity", "hateful": False},
 
-    # Pronoun reference (F14-F17)
-    "F14": {"name": "Hate expressed through reference in subsequent clauses", "hateful": True},
-    "F15": {"name": "Negated hate", "hateful": False},
-    "F16": {"name": "Hate phrased as a question", "hateful": True},
-    "F17": {"name": "Hate phrased as an opinion", "hateful": True},
+    # Reference and phrasing
+    "ref_subs_clause_h": {"name": "Hate expressed through reference in subsequent clauses", "hateful": True},
+    "ref_subs_sent_h": {"name": "Hate expressed through reference in subsequent sentences", "hateful": True},
+    "negate_neg_nh": {"name": "Negated hate", "hateful": False},
+    "negate_pos_h": {"name": "Non-negated hate statement", "hateful": True},
+    "phrase_question_h": {"name": "Hate phrased as a question", "hateful": True},
+    "phrase_opinion_h": {"name": "Hate phrased as an opinion", "hateful": True},
 
-    # Identity mentions (F18-F19)
-    "F18": {"name": "Neutral statements using protected group identifier", "hateful": False},
-    "F19": {"name": "Positive statements using protected group identifier", "hateful": False},
+    # Identity mentions
+    "ident_neutral_nh": {"name": "Neutral statements using protected group identifier", "hateful": False},
+    "ident_pos_nh": {"name": "Positive statements using protected group identifier", "hateful": False},
 
-    # Counter speech (F20-F21)
-    "F20": {"name": "Counter speech quoting hate", "hateful": False},
-    "F21": {"name": "Counter speech referencing hate", "hateful": False},
+    # Counter speech
+    "counter_quote_nh": {"name": "Counter speech quoting hate", "hateful": False},
+    "counter_ref_nh": {"name": "Counter speech referencing hate", "hateful": False},
 
-    # Target variations (F22-F24)
-    "F22": {"name": "Abuse targeted at objects", "hateful": False},
-    "F23": {"name": "Abuse targeted at individuals (not as members of protected group)", "hateful": False},
-    "F24": {"name": "Abuse targeted at non-protected group", "hateful": False},
+    # Target variations
+    "target_obj_nh": {"name": "Abuse targeted at objects", "hateful": False},
+    "target_indiv_nh": {"name": "Abuse targeted at individuals", "hateful": False},
+    "target_group_nh": {"name": "Abuse targeted at non-protected group", "hateful": False},
 
-    # Spelling variations (F25-F29)
-    "F25": {"name": "Hate with added spaces", "hateful": True},
-    "F26": {"name": "Hate with added punctuation", "hateful": True},
-    "F27": {"name": "Hate with added characters", "hateful": True},
-    "F28": {"name": "Hate with missing characters", "hateful": True},
-    "F29": {"name": "Hate with leet speak", "hateful": True},
+    # Spelling variations
+    "spell_space_add_h": {"name": "Hate with added spaces", "hateful": True},
+    "spell_space_del_h": {"name": "Hate with removed spaces", "hateful": True},
+    "spell_char_swap_h": {"name": "Hate with swapped characters", "hateful": True},
+    "spell_char_del_h": {"name": "Hate with deleted characters", "hateful": True},
+    "spell_leet_h": {"name": "Hate with leet speak", "hateful": True},
 }
 
-# Data limitation test groups
+# Data limitation test groups (using actual functionality names)
 DATA_LIMITATION_TESTS = {
-    "class_imbalance": ["F9", "F15"],  # Non-hate minority
-    "identity_bias": ["F18", "F19"],  # Identity term false positives
-    "domain_specificity": ["F20", "F21"],  # Counter speech
-    "lexical_coverage": ["F25", "F26", "F27", "F28", "F29"],  # Spelling variations
+    "class_imbalance": ["slur_reclaimed_nh", "negate_neg_nh"],  # Non-hate minority
+    "identity_bias": ["ident_neutral_nh", "ident_pos_nh"],  # Identity term false positives
+    "domain_specificity": ["counter_quote_nh", "counter_ref_nh"],  # Counter speech
+    "lexical_coverage": ["spell_space_add_h", "spell_space_del_h", "spell_char_swap_h", "spell_char_del_h", "spell_leet_h"],
 }
 
 
