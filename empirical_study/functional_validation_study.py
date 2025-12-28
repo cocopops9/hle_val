@@ -320,10 +320,11 @@ class FocalLossTrainer:
 
 class GraduatedTrainer:
     """
-    Trainer with graduated multi-dataset integration.
+    Trainer with multi-dataset integration.
 
-    Implements decaying secondary dataset (SBIC) weight:
-    w_SBIC(e) = w_0 * (1 - e/E)
+    Supports two modes:
+    1. Graduated decay: w_SBIC(e) = w_0 * (1 - e/E) - decays SBIC weight over epochs
+    2. Constant mixing: Maintains fixed ratio throughout training (e.g., 80% HateXplain / 20% SBIC)
 
     Where w_0 is initial SBIC weight (e.g., 0.3), e is current epoch, E is total epochs.
     """
@@ -352,17 +353,19 @@ class GraduatedTrainer:
         batch_size: int = 16,
         learning_rate: float = 1e-5,
         initial_secondary_weight: float = 0.3,
+        constant_mixing: bool = False,
     ):
         """
-        Train with graduated integration.
+        Train with multi-dataset integration.
 
         Args:
             primary_samples: Primary dataset (HateXplain)
-            secondary_samples: Secondary dataset (SBIC) with decaying weight
+            secondary_samples: Secondary dataset (SBIC)
             num_epochs: Total training epochs
             batch_size: Batch size
             learning_rate: Learning rate
-            initial_secondary_weight: Initial weight for secondary samples (w_0)
+            initial_secondary_weight: Weight for secondary samples (constant if constant_mixing=True)
+            constant_mixing: If True, maintain constant mixing ratio; if False, decay SBIC weight
         """
         from torch.utils.data import DataLoader, WeightedRandomSampler
         from torch.optim import AdamW
@@ -384,9 +387,15 @@ class GraduatedTrainer:
         for epoch in range(num_epochs):
             self.model.train()
 
-            # Compute current secondary weight: w_SBIC(e) = w_0 * (1 - e/E)
-            secondary_weight = initial_secondary_weight * (1 - epoch / num_epochs)
-            primary_weight = 1 - secondary_weight
+            # Compute mixing weights
+            if constant_mixing:
+                # Constant mixing: maintain fixed ratio throughout training
+                secondary_weight = initial_secondary_weight
+                primary_weight = 1 - secondary_weight
+            else:
+                # Graduated decay: w_SBIC(e) = w_0 * (1 - e/E)
+                secondary_weight = initial_secondary_weight * (1 - epoch / num_epochs)
+                primary_weight = 1 - secondary_weight
 
             logger.info(
                 f"Epoch {epoch + 1}/{num_epochs}: "
@@ -516,7 +525,7 @@ class FunctionalValidationStudy:
         output_dir: str = "./results/functional_validation",
         cache_dir: str = "./data/cache",
         device: Optional[str] = None,
-        n_train_samples: int = 6000,
+        n_train_samples: int = 8000,
         random_seed: int = 42,
     ):
         self.output_dir = Path(output_dir)
@@ -1173,10 +1182,10 @@ class FunctionalValidationStudy:
         )
         results["step3_contrastive"] = lambda_df
 
-        # Final: Train with all optimized components
+        # Final: Train with constant 80/20 mixing and focal loss only
         logger.info("\n" + "=" * 60)
-        logger.info("Phase 3 Final: Combined Optimized Training")
-        logger.info(f"γ* = {optimal_gamma}, λ*_con = {optimal_lambda}")
+        logger.info("Phase 3 Final: Focal Loss + Constant 80/20 Mixing")
+        logger.info(f"γ* = {optimal_gamma}, 80% HateXplain / 20% SBIC (constant)")
         logger.info("=" * 60)
 
         final_df = self._run_phase3_final(
@@ -1184,7 +1193,9 @@ class FunctionalValidationStudy:
             num_epochs=num_epochs,
             batch_size=batch_size,
             gamma=optimal_gamma,
-            lambda_con=optimal_lambda,
+            lambda_con=0.0,  # No contrastive loss
+            initial_sbic_weight=0.2,  # 20% SBIC constant
+            constant_mixing=True,
         )
         results["final"] = final_df
 
@@ -1196,11 +1207,15 @@ class FunctionalValidationStudy:
         num_epochs: int,
         batch_size: int,
         gamma: float,
-        lambda_con: float,
-        initial_sbic_weight: float = 0.3,
+        lambda_con: float = 0.0,
+        initial_sbic_weight: float = 0.2,
         temperature: float = 0.07,
+        constant_mixing: bool = True,
     ) -> pd.DataFrame:
-        """Run final combined training with optimized hyperparameters."""
+        """Run final combined training with optimized hyperparameters.
+
+        Uses constant 80/20 HateXplain/SBIC mixing with Focal Loss (γ=2).
+        """
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
         train_data = self.load_training_data()
@@ -1222,6 +1237,7 @@ class FunctionalValidationStudy:
             num_epochs=num_epochs,
             batch_size=batch_size,
             initial_secondary_weight=initial_sbic_weight,
+            constant_mixing=constant_mixing,
         )
 
         # Comprehensive evaluation
