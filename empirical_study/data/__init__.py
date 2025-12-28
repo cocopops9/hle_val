@@ -10,6 +10,11 @@ from .hate_speech import (
 )
 from .sarcasm import SemEvalSarcasmLoader, ISarcasmLoader
 from .dialectal import SapDialectalLoader
+from .hatecheck import (
+    HateCheckLoader,
+    FUNCTIONAL_TESTS,
+    DATA_LIMITATION_TESTS,
+)
 
 __all__ = [
     "DatasetLoader",
@@ -19,6 +24,10 @@ __all__ = [
     "SBICLoader",            # SBIC implicit hate (truly implicit - no slurs)
     "NonHateLoader",         # Non-hate for balancing
     "load_hate_speech_data", # Convenience function
+    # HateCheck diagnostic tests
+    "HateCheckLoader",
+    "FUNCTIONAL_TESTS",
+    "DATA_LIMITATION_TESTS",
     # Sarcasm loaders
     "SemEvalSarcasmLoader",
     "ISarcasmLoader",
