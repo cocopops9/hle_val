@@ -1193,49 +1193,260 @@ class FunctionalValidationStudy:
         batch_size: int = 16,
     ) -> Dict[str, pd.DataFrame]:
         """
-        Run complete Phase 3: Intervention optimization.
+        Run complete Phase 3: Two-Stage Training.
 
-        Step 1: Focal loss gamma tuning (with multi-dataset, balanced metric)
-        Final: Combined training with optimized gamma, no contrastive loss
+        This approach aims to Pareto-dominate P2_focal_loss by:
+        1. Stage 1: Multi-dataset training (HX+SBIC) with standard CE
+           - Learns broad hateful patterns
+        2. Stage 2: Fine-tune on HateXplain with focal loss
+           - Recalibrates for better non-hateful specificity
 
-        Note: Contrastive loss (Step 3) has been removed as it causes model instability.
+        Based on empirical findings:
+        - Contrastive loss causes instability (removed)
+        - Multi-dataset improves hateful detection
+        - Focal loss improves calibration
         """
         logger.info("=" * 60)
-        logger.info("Phase 3: Intervention Optimization")
+        logger.info("Phase 3: Two-Stage Training")
         logger.info("=" * 60)
 
         results = {}
 
-        # Step 1: Find optimal gamma using multi-dataset training and balanced metric
-        optimal_gamma, gamma_df = self.run_phase3_step1_gamma_tuning(
+        # Run two-stage training
+        twostage_df = self.run_phase3_twostage(
             model_type=model_type,
-            num_epochs=num_epochs,
+            stage1_epochs=2,
+            stage2_epochs=1,
             batch_size=batch_size,
+            stage2_gamma=2.0,
+            stage2_lr_factor=0.5,
         )
-        results["step1_gamma"] = gamma_df
-
-        # Skip Step 2 (graduated integration) - use constant mixing instead
-        # Skip Step 3 (contrastive loss) - causes model instability
-
-        # Final: Train with constant 80/20 mixing and focal loss only
-        logger.info("\n" + "=" * 60)
-        logger.info("Phase 3 Final: Focal Loss + Constant 80/20 Mixing")
-        logger.info(f"γ* = {optimal_gamma}, 80% HateXplain / 20% SBIC (constant)")
-        logger.info("No contrastive loss (λ=0) - removed due to instability")
-        logger.info("=" * 60)
-
-        final_df = self._run_phase3_final(
-            model_type=model_type,
-            num_epochs=num_epochs,
-            batch_size=batch_size,
-            gamma=optimal_gamma,
-            lambda_con=0.0,  # No contrastive loss
-            initial_sbic_weight=0.2,  # 20% SBIC constant
-            constant_mixing=True,
-        )
-        results["final"] = final_df
+        results["twostage"] = twostage_df
 
         return results
+
+    def run_phase3_twostage(
+        self,
+        model_type: str = "electra",
+        stage1_epochs: int = 2,
+        stage2_epochs: int = 1,
+        batch_size: int = 16,
+        stage2_gamma: float = 2.0,
+        stage2_lr_factor: float = 0.5,
+    ) -> pd.DataFrame:
+        """
+        Two-Stage Training: Pareto improvement over P2_focal_loss.
+
+        Stage 1: Multi-dataset training (HateXplain + SBIC) with standard CE
+        - Learns broad hateful patterns from diverse data
+        - Expected: High hateful accuracy (~80%), lower non-hateful (~50%)
+
+        Stage 2: Fine-tune on HateXplain only with focal loss
+        - Recalibrates decision boundary for better specificity
+        - Lower learning rate to preserve learned features
+        - Expected: Retain hateful gains, improve non-hateful
+
+        This combines P2_multi_dataset's coverage with P2_focal_loss's calibration.
+        """
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        from torch.utils.data import DataLoader
+        from torch.optim import AdamW
+
+        logger.info("=" * 60)
+        logger.info("Phase 3: Two-Stage Training")
+        logger.info("=" * 60)
+        logger.info(f"Stage 1: Multi-dataset (HX+SBIC), standard CE, {stage1_epochs} epochs")
+        logger.info(f"Stage 2: HateXplain only, focal loss (γ={stage2_gamma}), {stage2_epochs} epochs")
+
+        train_data = self.load_training_data()
+        hatecheck_samples = self.load_hatecheck()
+
+        model_path = self.MODELS.get(model_type, model_type)
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=2)
+
+        HateSpeechDataset = create_dataset_class()
+
+        # ============ Stage 1: Multi-dataset with standard CE ============
+        logger.info("\n--- Stage 1: Multi-dataset Training (Standard CE) ---")
+
+        combined_samples = train_data["hatexplain"] + train_data["sbic"]
+        np.random.seed(self.random_seed)
+        np.random.shuffle(combined_samples)
+
+        # Log distribution
+        stage1_hateful = sum(1 for s in combined_samples if s.label == 1)
+        stage1_nonhateful = sum(1 for s in combined_samples if s.label == 0)
+        logger.info(f"Stage 1 samples: {len(combined_samples)} total, "
+                    f"{stage1_hateful} hateful, {stage1_nonhateful} non-hateful")
+
+        train_dataset = HateSpeechDataset(combined_samples, tokenizer)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+        model.to(self.device)
+        optimizer = AdamW(model.parameters(), lr=1e-5)
+        criterion = torch.nn.CrossEntropyLoss()
+
+        for epoch in range(stage1_epochs):
+            model.train()
+            total_loss = 0
+            for batch in train_loader:
+                optimizer.zero_grad()
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                loss = criterion(outputs.logits, labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+
+            logger.info(f"Stage 1 Epoch {epoch + 1}/{stage1_epochs}, Loss: {total_loss / len(train_loader):.4f}")
+
+        # Evaluate after Stage 1
+        stage1_results = self._evaluate_model(model, tokenizer, hatecheck_samples)
+        stage1_h = np.mean([r.accuracy for r in stage1_results if r.hateful_expected is True])
+        stage1_nh = np.mean([r.accuracy for r in stage1_results if r.hateful_expected is False])
+        logger.info(f"After Stage 1: Hateful={stage1_h:.3f}, Non-Hateful={stage1_nh:.3f}")
+
+        # ============ Stage 2: HateXplain with Focal Loss ============
+        logger.info("\n--- Stage 2: Fine-tuning with Focal Loss ---")
+
+        hx_samples = train_data["hatexplain"]
+        hx_hateful = sum(1 for s in hx_samples if s.label == 1)
+        hx_nonhateful = sum(1 for s in hx_samples if s.label == 0)
+        logger.info(f"Stage 2 samples: {len(hx_samples)} HateXplain, "
+                    f"{hx_hateful} hateful, {hx_nonhateful} non-hateful")
+
+        train_dataset = HateSpeechDataset(hx_samples, tokenizer)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+        # Compute class weights for focal loss
+        class_counts = [hx_nonhateful, hx_hateful]
+        total = sum(class_counts)
+        alpha = torch.tensor([total / (2 * c) if c > 0 else 1.0 for c in class_counts]).to(self.device)
+        logger.info(f"Focal Loss: gamma={stage2_gamma}, alpha={alpha.tolist()}")
+
+        focal_loss = FocalLoss(alpha=alpha, gamma=stage2_gamma)
+
+        # Lower learning rate for fine-tuning
+        stage2_lr = 1e-5 * stage2_lr_factor
+        optimizer = AdamW(model.parameters(), lr=stage2_lr)
+        logger.info(f"Stage 2 learning rate: {stage2_lr}")
+
+        for epoch in range(stage2_epochs):
+            model.train()
+            total_loss = 0
+            for batch in train_loader:
+                optimizer.zero_grad()
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                loss = focal_loss(outputs.logits, labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+
+            logger.info(f"Stage 2 Epoch {epoch + 1}/{stage2_epochs}, Loss: {total_loss / len(train_loader):.4f}")
+
+        # ============ Final Evaluation ============
+        logger.info("\n--- Final Evaluation ---")
+        test_results = self._evaluate_model(model, tokenizer, hatecheck_samples)
+
+        hateful_results = [r for r in test_results if r.hateful_expected is True]
+        nonhateful_results = [r for r in test_results if r.hateful_expected is False]
+
+        macro_hateful = np.mean([r.accuracy for r in hateful_results]) if hateful_results else 0
+        macro_nonhateful = np.mean([r.accuracy for r in nonhateful_results]) if nonhateful_results else 0
+        overall = np.mean([r.accuracy for r in test_results])
+
+        logger.info(f"\nFinal Results:")
+        logger.info(f"  Macro accuracy (hateful): {macro_hateful:.3f}")
+        logger.info(f"  Macro accuracy (non-hateful): {macro_nonhateful:.3f}")
+        logger.info(f"  Overall accuracy: {overall:.3f}")
+
+        # Comparison with P2 baselines
+        logger.info(f"\nComparison with P2_focal_loss (H=46.4%, NH=79.4%):")
+        h_delta = (macro_hateful - 0.464) * 100
+        nh_delta = (macro_nonhateful - 0.794) * 100
+        logger.info(f"  Δ Hateful: {h_delta:+.1f} pp")
+        logger.info(f"  Δ Non-Hateful: {nh_delta:+.1f} pp")
+
+        if macro_hateful >= 0.464 and macro_nonhateful >= 0.794:
+            logger.info("  ✓ PARETO DOMINATES P2_focal_loss!")
+        elif macro_hateful > 0.464 and macro_nonhateful >= 0.70:
+            logger.info("  ~ Near-Pareto improvement (H improved, NH acceptable)")
+        else:
+            logger.info("  ✗ Does not Pareto-dominate")
+
+        rows = [{
+            "test_id": r.test_id,
+            "test_name": r.test_name,
+            "accuracy": r.accuracy,
+            "n_samples": r.n_samples,
+            "hateful_expected": r.hateful_expected,
+            "stage1_epochs": stage1_epochs,
+            "stage2_epochs": stage2_epochs,
+            "stage2_gamma": stage2_gamma,
+        } for r in test_results]
+
+        df = pd.DataFrame(rows)
+        self._save_results(df, "phase3_twostage")
+
+        del model
+        if HAS_TORCH:
+            torch.cuda.empty_cache()
+
+        return df
+
+    def _evaluate_model(
+        self,
+        model,
+        tokenizer,
+        hatecheck_samples: Dict[str, List[Sample]],
+    ) -> List[FunctionalTestResult]:
+        """Evaluate model on HateCheck functional tests."""
+        from torch.utils.data import DataLoader
+
+        HateSpeechDataset = create_dataset_class()
+        model.eval()
+        test_results = []
+
+        for test_id, samples in hatecheck_samples.items():
+            if not samples:
+                continue
+
+            dataset = HateSpeechDataset(samples, tokenizer)
+            loader = DataLoader(dataset, batch_size=16, shuffle=False)
+
+            all_preds = []
+            with torch.no_grad():
+                for batch in loader:
+                    input_ids = batch["input_ids"].to(self.device)
+                    attention_mask = batch["attention_mask"].to(self.device)
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    preds = torch.argmax(outputs.logits, dim=1)
+                    all_preds.extend(preds.cpu().numpy())
+
+            preds = np.array(all_preds)
+            labels = np.array([s.label for s in samples])
+            accuracy = accuracy_score(labels, preds)
+
+            result = FunctionalTestResult(
+                test_id=test_id,
+                test_name=FUNCTIONAL_TESTS.get(test_id, {}).get("name", ""),
+                n_samples=len(samples),
+                accuracy=accuracy,
+                hateful_expected=FUNCTIONAL_TESTS.get(test_id, {}).get("hateful", None),
+                predictions_hateful=int(sum(preds == 1)),
+                predictions_non_hateful=int(sum(preds == 0)),
+            )
+            test_results.append(result)
+
+        return test_results
 
     def _run_phase3_final(
         self,
