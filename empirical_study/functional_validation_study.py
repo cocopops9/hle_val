@@ -1213,13 +1213,18 @@ class FunctionalValidationStudy:
         results = {}
 
         # Run two-stage training
+        # Stage 2 tuned to counteract Stage 1's hateful bias:
+        # - 2 epochs (more time to recalibrate)
+        # - gamma=1.0 (less aggressive focusing)
+        # - LR factor=1.0 (full learning rate for stronger shift)
+        # - Asymmetric alpha (4:1 non-hateful weighting in code)
         twostage_df = self.run_phase3_twostage(
             model_type=model_type,
             stage1_epochs=2,
-            stage2_epochs=1,
+            stage2_epochs=2,
             batch_size=batch_size,
-            stage2_gamma=2.0,
-            stage2_lr_factor=0.5,
+            stage2_gamma=1.0,
+            stage2_lr_factor=1.0,
         )
         results["twostage"] = twostage_df
 
@@ -1322,11 +1327,11 @@ class FunctionalValidationStudy:
         train_dataset = HateSpeechDataset(hx_samples, tokenizer)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-        # Compute class weights for focal loss
-        class_counts = [hx_nonhateful, hx_hateful]
-        total = sum(class_counts)
-        alpha = torch.tensor([total / (2 * c) if c > 0 else 1.0 for c in class_counts]).to(self.device)
-        logger.info(f"Focal Loss: gamma={stage2_gamma}, alpha={alpha.tolist()}")
+        # Asymmetric class weights: heavily favor non-hateful to counteract Stage 1 bias
+        # After Stage 1, model is hateful-biased, so we need to push toward non-hateful
+        # alpha[0] = non-hateful weight, alpha[1] = hateful weight
+        alpha = torch.tensor([2.0, 0.5]).to(self.device)  # 4:1 ratio favoring non-hateful
+        logger.info(f"Focal Loss: gamma={stage2_gamma}, alpha={alpha.tolist()} (asymmetric: 4:1 non-hateful)")
 
         focal_loss = FocalLoss(alpha=alpha, gamma=stage2_gamma)
 
