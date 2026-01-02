@@ -1195,10 +1195,10 @@ class FunctionalValidationStudy:
         """
         Run complete Phase 3: Intervention optimization.
 
-        Step 1: Focal loss gamma tuning
-        Step 2: Graduated multi-dataset integration
-        Step 3: Contrastive discrimination
-        Final: Combined training with optimized hyperparameters
+        Step 1: Focal loss gamma tuning (with multi-dataset, balanced metric)
+        Final: Combined training with optimized gamma, no contrastive loss
+
+        Note: Contrastive loss (Step 3) has been removed as it causes model instability.
         """
         logger.info("=" * 60)
         logger.info("Phase 3: Intervention Optimization")
@@ -1206,7 +1206,7 @@ class FunctionalValidationStudy:
 
         results = {}
 
-        # Step 1: Find optimal gamma
+        # Step 1: Find optimal gamma using multi-dataset training and balanced metric
         optimal_gamma, gamma_df = self.run_phase3_step1_gamma_tuning(
             model_type=model_type,
             num_epochs=num_epochs,
@@ -1214,28 +1214,14 @@ class FunctionalValidationStudy:
         )
         results["step1_gamma"] = gamma_df
 
-        # Step 2: Graduated integration with optimal gamma
-        graduated_df = self.run_phase3_step2_graduated(
-            model_type=model_type,
-            num_epochs=num_epochs,
-            batch_size=batch_size,
-            gamma=optimal_gamma,
-        )
-        results["step2_graduated"] = graduated_df
-
-        # Step 3: Find optimal lambda_con
-        optimal_lambda, lambda_df = self.run_phase3_step3_contrastive(
-            model_type=model_type,
-            num_epochs=num_epochs,
-            batch_size=batch_size,
-            gamma=optimal_gamma,
-        )
-        results["step3_contrastive"] = lambda_df
+        # Skip Step 2 (graduated integration) - use constant mixing instead
+        # Skip Step 3 (contrastive loss) - causes model instability
 
         # Final: Train with constant 80/20 mixing and focal loss only
         logger.info("\n" + "=" * 60)
         logger.info("Phase 3 Final: Focal Loss + Constant 80/20 Mixing")
         logger.info(f"γ* = {optimal_gamma}, 80% HateXplain / 20% SBIC (constant)")
+        logger.info("No contrastive loss (λ=0) - removed due to instability")
         logger.info("=" * 60)
 
         final_df = self._run_phase3_final(
