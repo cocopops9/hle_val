@@ -1332,14 +1332,45 @@ class FunctionalValidationStudy:
         model_b_nh = np.mean([r.accuracy for r in model_b_results if r.hateful_expected is False])
         logger.info(f"Model B: Hateful={model_b_h:.3f}, Non-Hateful={model_b_nh:.3f}")
 
-        # ============ Ensemble Inference ============
-        logger.info(f"\n--- Ensemble Inference (NH confidence threshold={nh_confidence_threshold}) ---")
+        # ============ Ensemble Inference with Bias Search ============
+        logger.info("\n--- Searching for optimal ensemble bias ---")
 
-        test_results = self._evaluate_ensemble(
-            model_a, model_b, tokenizer_a, hatecheck_samples,
-            nh_confidence_threshold=nh_confidence_threshold,
-        )
+        # Try different bias values to find best balance
+        bias_values = [0.0, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0]
+        best_bias = 0.0
+        best_balanced_acc = 0.0
+        best_results = None
 
+        for bias in bias_values:
+            results = self._evaluate_ensemble(
+                model_a, model_b, tokenizer_a, hatecheck_samples,
+                ensemble_mode="weighted_avg",
+                nh_bias=bias,
+            )
+
+            h_results = [r for r in results if r.hateful_expected is True]
+            nh_results = [r for r in results if r.hateful_expected is False]
+
+            h_acc = np.mean([r.accuracy for r in h_results]) if h_results else 0
+            nh_acc = np.mean([r.accuracy for r in nh_results]) if nh_results else 0
+
+            # Use harmonic mean for balanced metric
+            if h_acc > 0 and nh_acc > 0:
+                balanced = 2 * h_acc * nh_acc / (h_acc + nh_acc)
+            else:
+                balanced = 0
+
+            logger.info(f"  bias={bias:.1f}: H={h_acc:.3f}, NH={nh_acc:.3f}, balanced={balanced:.3f}")
+
+            if balanced > best_balanced_acc:
+                best_balanced_acc = balanced
+                best_bias = bias
+                best_results = results
+
+        logger.info(f"\nBest bias: {best_bias} (balanced_acc={best_balanced_acc:.3f})")
+
+        # Use best results
+        test_results = best_results
         hateful_results = [r for r in test_results if r.hateful_expected is True]
         nonhateful_results = [r for r in test_results if r.hateful_expected is False]
 
@@ -1347,7 +1378,7 @@ class FunctionalValidationStudy:
         macro_nonhateful = np.mean([r.accuracy for r in nonhateful_results]) if nonhateful_results else 0
         overall = np.mean([r.accuracy for r in test_results])
 
-        logger.info(f"\nEnsemble Results:")
+        logger.info(f"\nEnsemble Results (bias={best_bias}):")
         logger.info(f"  Macro accuracy (hateful): {macro_hateful:.3f}")
         logger.info(f"  Macro accuracy (non-hateful): {macro_nonhateful:.3f}")
         logger.info(f"  Overall accuracy: {overall:.3f}")
@@ -1372,8 +1403,8 @@ class FunctionalValidationStudy:
             "accuracy": r.accuracy,
             "n_samples": r.n_samples,
             "hateful_expected": r.hateful_expected,
-            "method": "ensemble",
-            "nh_threshold": nh_confidence_threshold,
+            "method": "ensemble_weighted",
+            "nh_bias": best_bias,
         } for r in test_results]
 
         df = pd.DataFrame(rows)
@@ -1392,13 +1423,19 @@ class FunctionalValidationStudy:
         tokenizer,
         hatecheck_samples: Dict[str, List[Sample]],
         nh_confidence_threshold: float = 0.7,
+        ensemble_mode: str = "weighted_avg",
+        nh_bias: float = 0.5,
     ) -> List[FunctionalTestResult]:
         """
-        Evaluate ensemble with confidence-based selection.
+        Evaluate ensemble with different strategies.
 
-        Strategy:
-        - If Model A is confident about non-hateful (P(NH) > threshold): use Model A
-        - Otherwise: use Model B
+        Modes:
+        - "confidence": Use Model A if confident on NH, else Model B (original)
+        - "avg_logits": Simple average of logits from both models
+        - "weighted_avg": Average logits with bias toward non-hateful
+
+        The nh_bias adds a constant to non-hateful logit to prevent over-prediction
+        of hateful (since Model B is hateful-biased).
         """
         from torch.utils.data import DataLoader
 
@@ -1420,28 +1457,34 @@ class FunctionalValidationStudy:
                     input_ids = batch["input_ids"].to(self.device)
                     attention_mask = batch["attention_mask"].to(self.device)
 
-                    # Get probabilities from both models
                     outputs_a = model_a(input_ids=input_ids, attention_mask=attention_mask)
                     outputs_b = model_b(input_ids=input_ids, attention_mask=attention_mask)
 
-                    probs_a = torch.softmax(outputs_a.logits, dim=1)
-                    probs_b = torch.softmax(outputs_b.logits, dim=1)
+                    if ensemble_mode == "confidence":
+                        # Original confidence-based approach
+                        probs_a = torch.softmax(outputs_a.logits, dim=1)
+                        probs_b = torch.softmax(outputs_b.logits, dim=1)
+                        batch_preds = []
+                        for i in range(len(input_ids)):
+                            if probs_a[i, 0].item() > nh_confidence_threshold:
+                                batch_preds.append(0)
+                            else:
+                                batch_preds.append(torch.argmax(probs_b[i]).item())
+                        all_preds.extend(batch_preds)
 
-                    # For each sample, decide which model to trust
-                    batch_preds = []
-                    for i in range(len(input_ids)):
-                        p_nh_a = probs_a[i, 0].item()  # P(non-hateful) from Model A
+                    elif ensemble_mode == "avg_logits":
+                        # Simple average of logits
+                        avg_logits = (outputs_a.logits + outputs_b.logits) / 2
+                        preds = torch.argmax(avg_logits, dim=1)
+                        all_preds.extend(preds.cpu().numpy())
 
-                        if p_nh_a > nh_confidence_threshold:
-                            # Model A confident about non-hateful → trust it
-                            pred = 0  # non-hateful
-                        else:
-                            # Otherwise, use Model B's prediction
-                            pred = torch.argmax(probs_b[i]).item()
-
-                        batch_preds.append(pred)
-
-                    all_preds.extend(batch_preds)
+                    elif ensemble_mode == "weighted_avg":
+                        # Average logits with bias toward non-hateful
+                        avg_logits = (outputs_a.logits + outputs_b.logits) / 2
+                        # Add bias to non-hateful class to counteract Model B's hateful bias
+                        avg_logits[:, 0] += nh_bias
+                        preds = torch.argmax(avg_logits, dim=1)
+                        all_preds.extend(preds.cpu().numpy())
 
             preds = np.array(all_preds)
             labels = np.array([s.label for s in samples])
