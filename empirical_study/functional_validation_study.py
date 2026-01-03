@@ -1193,39 +1193,272 @@ class FunctionalValidationStudy:
         batch_size: int = 16,
     ) -> Dict[str, pd.DataFrame]:
         """
-        Run complete Phase 3: Two-Stage Training.
+        Run complete Phase 3: Confidence-Based Ensemble.
 
-        This approach aims to Pareto-dominate P2_focal_loss by:
-        1. Stage 1: Multi-dataset training (HX+SBIC) with standard CE
-           - Learns broad hateful patterns
-        2. Stage 2: Fine-tune on HateXplain with focal loss
-           - Recalibrates for better non-hateful specificity
+        This approach uses two complementary models:
+        1. Model A (Focal Loss on HateXplain): Strong on non-hateful detection
+        2. Model B (Multi-dataset): Strong on hateful detection
 
-        Based on empirical findings:
-        - Contrastive loss causes instability (removed)
-        - Multi-dataset improves hateful detection
-        - Focal loss improves calibration
+        At inference, use confidence-weighted combination to get best of both.
         """
         logger.info("=" * 60)
-        logger.info("Phase 3: Two-Stage Training")
+        logger.info("Phase 3: Confidence-Based Ensemble")
         logger.info("=" * 60)
 
         results = {}
 
-        # Run two-stage training (REVERSED approach)
-        # Stage 1: HateXplain + Focal Loss (like P2_focal_loss) → balanced classifier
-        # Stage 2: Add SBIC hateful only with low LR → expand coverage without breaking balance
-        twostage_df = self.run_phase3_twostage(
+        # Run ensemble approach
+        ensemble_df = self.run_phase3_ensemble(
             model_type=model_type,
-            stage1_epochs=3,
-            stage2_epochs=1,
+            num_epochs=num_epochs,
             batch_size=batch_size,
-            stage1_gamma=2.0,
-            stage2_lr_factor=0.3,
         )
-        results["twostage"] = twostage_df
+        results["ensemble"] = ensemble_df
 
         return results
+
+    def run_phase3_ensemble(
+        self,
+        model_type: str = "electra",
+        num_epochs: int = 3,
+        batch_size: int = 16,
+        nh_confidence_threshold: float = 0.7,
+    ) -> pd.DataFrame:
+        """
+        Confidence-Based Ensemble for Pareto improvement.
+
+        Strategy:
+        1. Train Model A: HateXplain + Focal Loss (γ=2) → Strong on NH (like P2_focal_loss)
+        2. Train Model B: HateXplain + SBIC + Standard CE → Strong on H (like P2_multi_dataset)
+
+        At inference:
+        - If Model A confident on non-hateful (P(NH) > threshold): predict non-hateful
+        - Otherwise: use Model B's prediction
+
+        This leverages Model A's conservative NH detection while using Model B's
+        broader hateful coverage for uncertain cases.
+        """
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        from torch.utils.data import DataLoader
+        from torch.optim import AdamW
+
+        logger.info("=" * 60)
+        logger.info("Phase 3: Confidence-Based Ensemble")
+        logger.info("=" * 60)
+
+        train_data = self.load_training_data()
+        hatecheck_samples = self.load_hatecheck()
+
+        model_path = self.MODELS.get(model_type, model_type)
+        HateSpeechDataset = create_dataset_class()
+
+        # ============ Train Model A: Focal Loss (like P2_focal_loss) ============
+        logger.info("\n--- Training Model A: HateXplain + Focal Loss ---")
+
+        tokenizer_a = AutoTokenizer.from_pretrained(model_path)
+        model_a = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=2)
+
+        hx_samples = train_data["hatexplain"]
+        train_dataset = HateSpeechDataset(hx_samples, tokenizer_a)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+        # Focal loss with balanced alpha
+        hx_hateful = sum(1 for s in hx_samples if s.label == 1)
+        hx_nonhateful = sum(1 for s in hx_samples if s.label == 0)
+        class_counts = [hx_nonhateful, hx_hateful]
+        total = sum(class_counts)
+        alpha = torch.tensor([total / (2 * c) if c > 0 else 1.0 for c in class_counts]).to(self.device)
+        focal_loss = FocalLoss(alpha=alpha, gamma=2.0)
+
+        model_a.to(self.device)
+        optimizer = AdamW(model_a.parameters(), lr=1e-5)
+
+        for epoch in range(num_epochs):
+            model_a.train()
+            total_loss = 0
+            for batch in train_loader:
+                optimizer.zero_grad()
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
+                outputs = model_a(input_ids=input_ids, attention_mask=attention_mask)
+                loss = focal_loss(outputs.logits, labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            logger.info(f"Model A Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss / len(train_loader):.4f}")
+
+        # Evaluate Model A alone
+        model_a_results = self._evaluate_model(model_a, tokenizer_a, hatecheck_samples)
+        model_a_h = np.mean([r.accuracy for r in model_a_results if r.hateful_expected is True])
+        model_a_nh = np.mean([r.accuracy for r in model_a_results if r.hateful_expected is False])
+        logger.info(f"Model A: Hateful={model_a_h:.3f}, Non-Hateful={model_a_nh:.3f}")
+
+        # ============ Train Model B: Multi-dataset (like P2_multi_dataset) ============
+        logger.info("\n--- Training Model B: Multi-dataset + Standard CE ---")
+
+        tokenizer_b = AutoTokenizer.from_pretrained(model_path)
+        model_b = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=2)
+
+        combined_samples = train_data["hatexplain"] + train_data["sbic"]
+        np.random.seed(self.random_seed)
+        np.random.shuffle(combined_samples)
+
+        train_dataset = HateSpeechDataset(combined_samples, tokenizer_b)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+        model_b.to(self.device)
+        optimizer = AdamW(model_b.parameters(), lr=1e-5)
+        criterion = torch.nn.CrossEntropyLoss()
+
+        for epoch in range(num_epochs):
+            model_b.train()
+            total_loss = 0
+            for batch in train_loader:
+                optimizer.zero_grad()
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
+                outputs = model_b(input_ids=input_ids, attention_mask=attention_mask)
+                loss = criterion(outputs.logits, labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            logger.info(f"Model B Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss / len(train_loader):.4f}")
+
+        # Evaluate Model B alone
+        model_b_results = self._evaluate_model(model_b, tokenizer_b, hatecheck_samples)
+        model_b_h = np.mean([r.accuracy for r in model_b_results if r.hateful_expected is True])
+        model_b_nh = np.mean([r.accuracy for r in model_b_results if r.hateful_expected is False])
+        logger.info(f"Model B: Hateful={model_b_h:.3f}, Non-Hateful={model_b_nh:.3f}")
+
+        # ============ Ensemble Inference ============
+        logger.info(f"\n--- Ensemble Inference (NH confidence threshold={nh_confidence_threshold}) ---")
+
+        test_results = self._evaluate_ensemble(
+            model_a, model_b, tokenizer_a, hatecheck_samples,
+            nh_confidence_threshold=nh_confidence_threshold,
+        )
+
+        hateful_results = [r for r in test_results if r.hateful_expected is True]
+        nonhateful_results = [r for r in test_results if r.hateful_expected is False]
+
+        macro_hateful = np.mean([r.accuracy for r in hateful_results]) if hateful_results else 0
+        macro_nonhateful = np.mean([r.accuracy for r in nonhateful_results]) if nonhateful_results else 0
+        overall = np.mean([r.accuracy for r in test_results])
+
+        logger.info(f"\nEnsemble Results:")
+        logger.info(f"  Macro accuracy (hateful): {macro_hateful:.3f}")
+        logger.info(f"  Macro accuracy (non-hateful): {macro_nonhateful:.3f}")
+        logger.info(f"  Overall accuracy: {overall:.3f}")
+
+        # Comparison with baselines
+        logger.info(f"\nComparison with P2_focal_loss (H=46.4%, NH=79.4%):")
+        h_delta = (macro_hateful - 0.464) * 100
+        nh_delta = (macro_nonhateful - 0.794) * 100
+        logger.info(f"  Δ Hateful: {h_delta:+.1f} pp")
+        logger.info(f"  Δ Non-Hateful: {nh_delta:+.1f} pp")
+
+        if macro_hateful >= 0.464 and macro_nonhateful >= 0.794:
+            logger.info("  ✓ PARETO DOMINATES P2_focal_loss!")
+        elif macro_hateful > 0.50 and macro_nonhateful >= 0.70:
+            logger.info("  ~ Near-Pareto improvement")
+        else:
+            logger.info("  ✗ Does not Pareto-dominate")
+
+        rows = [{
+            "test_id": r.test_id,
+            "test_name": r.test_name,
+            "accuracy": r.accuracy,
+            "n_samples": r.n_samples,
+            "hateful_expected": r.hateful_expected,
+            "method": "ensemble",
+            "nh_threshold": nh_confidence_threshold,
+        } for r in test_results]
+
+        df = pd.DataFrame(rows)
+        self._save_results(df, "phase3_ensemble")
+
+        del model_a, model_b
+        if HAS_TORCH:
+            torch.cuda.empty_cache()
+
+        return df
+
+    def _evaluate_ensemble(
+        self,
+        model_a,
+        model_b,
+        tokenizer,
+        hatecheck_samples: Dict[str, List[Sample]],
+        nh_confidence_threshold: float = 0.7,
+    ) -> List[FunctionalTestResult]:
+        """
+        Evaluate ensemble with confidence-based selection.
+
+        Strategy:
+        - If Model A is confident about non-hateful (P(NH) > threshold): use Model A
+        - Otherwise: use Model B
+        """
+        from torch.utils.data import DataLoader
+
+        HateSpeechDataset = create_dataset_class()
+        model_a.eval()
+        model_b.eval()
+        test_results = []
+
+        for test_id, samples in hatecheck_samples.items():
+            if not samples:
+                continue
+
+            dataset = HateSpeechDataset(samples, tokenizer)
+            loader = DataLoader(dataset, batch_size=16, shuffle=False)
+
+            all_preds = []
+            with torch.no_grad():
+                for batch in loader:
+                    input_ids = batch["input_ids"].to(self.device)
+                    attention_mask = batch["attention_mask"].to(self.device)
+
+                    # Get probabilities from both models
+                    outputs_a = model_a(input_ids=input_ids, attention_mask=attention_mask)
+                    outputs_b = model_b(input_ids=input_ids, attention_mask=attention_mask)
+
+                    probs_a = torch.softmax(outputs_a.logits, dim=1)
+                    probs_b = torch.softmax(outputs_b.logits, dim=1)
+
+                    # For each sample, decide which model to trust
+                    batch_preds = []
+                    for i in range(len(input_ids)):
+                        p_nh_a = probs_a[i, 0].item()  # P(non-hateful) from Model A
+
+                        if p_nh_a > nh_confidence_threshold:
+                            # Model A confident about non-hateful → trust it
+                            pred = 0  # non-hateful
+                        else:
+                            # Otherwise, use Model B's prediction
+                            pred = torch.argmax(probs_b[i]).item()
+
+                        batch_preds.append(pred)
+
+                    all_preds.extend(batch_preds)
+
+            preds = np.array(all_preds)
+            labels = np.array([s.label for s in samples])
+            accuracy = accuracy_score(labels, preds)
+
+            result = FunctionalTestResult(
+                test_id=test_id,
+                test_name=FUNCTIONAL_TESTS.get(test_id, {}).get("name", ""),
+                n_samples=len(samples),
+                accuracy=accuracy,
+                hateful_expected=FUNCTIONAL_TESTS.get(test_id, {}).get("hateful", None),
+                predictions_hateful=int(sum(preds == 1)),
+                predictions_non_hateful=int(sum(preds == 0)),
+            )
+            test_results.append(result)
+
+        return test_results
 
     def run_phase3_twostage(
         self,
