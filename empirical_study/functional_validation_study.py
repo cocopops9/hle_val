@@ -1212,19 +1212,16 @@ class FunctionalValidationStudy:
 
         results = {}
 
-        # Run two-stage training
-        # Stage 2 tuned to counteract Stage 1's hateful bias:
-        # - 2 epochs (more time to recalibrate)
-        # - gamma=1.0 (less aggressive focusing)
-        # - LR factor=1.0 (full learning rate for stronger shift)
-        # - Asymmetric alpha (4:1 non-hateful weighting in code)
+        # Run two-stage training (REVERSED approach)
+        # Stage 1: HateXplain + Focal Loss (like P2_focal_loss) → balanced classifier
+        # Stage 2: Add SBIC hateful only with low LR → expand coverage without breaking balance
         twostage_df = self.run_phase3_twostage(
             model_type=model_type,
-            stage1_epochs=2,
-            stage2_epochs=2,
+            stage1_epochs=3,
+            stage2_epochs=1,
             batch_size=batch_size,
-            stage2_gamma=1.0,
-            stage2_lr_factor=1.0,
+            stage1_gamma=2.0,
+            stage2_lr_factor=0.3,
         )
         results["twostage"] = twostage_df
 
@@ -1233,35 +1230,39 @@ class FunctionalValidationStudy:
     def run_phase3_twostage(
         self,
         model_type: str = "electra",
-        stage1_epochs: int = 2,
+        stage1_epochs: int = 3,
         stage2_epochs: int = 1,
         batch_size: int = 16,
-        stage2_gamma: float = 2.0,
-        stage2_lr_factor: float = 0.5,
+        stage1_gamma: float = 2.0,
+        stage2_lr_factor: float = 0.3,
     ) -> pd.DataFrame:
         """
         Two-Stage Training: Pareto improvement over P2_focal_loss.
 
-        Stage 1: Multi-dataset training (HateXplain + SBIC) with standard CE
-        - Learns broad hateful patterns from diverse data
-        - Expected: High hateful accuracy (~80%), lower non-hateful (~50%)
+        REVERSED APPROACH (previous attempts failed by starting with multi-dataset):
 
-        Stage 2: Fine-tune on HateXplain only with focal loss
-        - Recalibrates decision boundary for better specificity
-        - Lower learning rate to preserve learned features
-        - Expected: Retain hateful gains, improve non-hateful
+        Stage 1: HateXplain + Focal Loss (γ=2)
+        - Learn BALANCED classification first (like P2_focal_loss)
+        - Expected: ~46% H, ~79% NH
 
-        This combines P2_multi_dataset's coverage with P2_focal_loss's calibration.
+        Stage 2: Add SBIC hateful samples only, lower LR
+        - Expand hateful coverage without breaking non-hateful accuracy
+        - Only add SBIC samples labeled as hateful (implicit hate patterns)
+        - Very low learning rate to preserve balanced features
+        - Use standard CE (not focal loss) to avoid over-correction
+
+        This builds ON TOP of P2_focal_loss rather than trying to fix
+        P2_multi_dataset's inherent bias.
         """
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
         from torch.utils.data import DataLoader
         from torch.optim import AdamW
 
         logger.info("=" * 60)
-        logger.info("Phase 3: Two-Stage Training")
+        logger.info("Phase 3: Two-Stage Training (Reversed Approach)")
         logger.info("=" * 60)
-        logger.info(f"Stage 1: Multi-dataset (HX+SBIC), standard CE, {stage1_epochs} epochs")
-        logger.info(f"Stage 2: HateXplain only, focal loss (γ={stage2_gamma}), {stage2_epochs} epochs")
+        logger.info(f"Stage 1: HateXplain + Focal Loss (γ={stage1_gamma}), {stage1_epochs} epochs")
+        logger.info(f"Stage 2: Add SBIC hateful only, LR={stage2_lr_factor}x, {stage2_epochs} epochs")
 
         train_data = self.load_training_data()
         hatecheck_samples = self.load_hatecheck()
@@ -1272,25 +1273,28 @@ class FunctionalValidationStudy:
 
         HateSpeechDataset = create_dataset_class()
 
-        # ============ Stage 1: Multi-dataset with standard CE ============
-        logger.info("\n--- Stage 1: Multi-dataset Training (Standard CE) ---")
+        # ============ Stage 1: HateXplain with Focal Loss ============
+        logger.info("\n--- Stage 1: HateXplain + Focal Loss (Balanced) ---")
 
-        combined_samples = train_data["hatexplain"] + train_data["sbic"]
-        np.random.seed(self.random_seed)
-        np.random.shuffle(combined_samples)
+        hx_samples = train_data["hatexplain"]
+        hx_hateful = sum(1 for s in hx_samples if s.label == 1)
+        hx_nonhateful = sum(1 for s in hx_samples if s.label == 0)
+        logger.info(f"Stage 1 samples: {len(hx_samples)} HateXplain, "
+                    f"{hx_hateful} hateful, {hx_nonhateful} non-hateful")
 
-        # Log distribution
-        stage1_hateful = sum(1 for s in combined_samples if s.label == 1)
-        stage1_nonhateful = sum(1 for s in combined_samples if s.label == 0)
-        logger.info(f"Stage 1 samples: {len(combined_samples)} total, "
-                    f"{stage1_hateful} hateful, {stage1_nonhateful} non-hateful")
-
-        train_dataset = HateSpeechDataset(combined_samples, tokenizer)
+        train_dataset = HateSpeechDataset(hx_samples, tokenizer)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+        # Balanced alpha for focal loss
+        class_counts = [hx_nonhateful, hx_hateful]
+        total = sum(class_counts)
+        alpha = torch.tensor([total / (2 * c) if c > 0 else 1.0 for c in class_counts]).to(self.device)
+        logger.info(f"Focal Loss: gamma={stage1_gamma}, alpha={alpha.tolist()}")
+
+        focal_loss = FocalLoss(alpha=alpha, gamma=stage1_gamma)
 
         model.to(self.device)
         optimizer = AdamW(model.parameters(), lr=1e-5)
-        criterion = torch.nn.CrossEntropyLoss()
 
         for epoch in range(stage1_epochs):
             model.train()
@@ -1302,7 +1306,7 @@ class FunctionalValidationStudy:
                 labels = batch["labels"].to(self.device)
 
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                loss = criterion(outputs.logits, labels)
+                loss = focal_loss(outputs.logits, labels)
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
@@ -1315,30 +1319,33 @@ class FunctionalValidationStudy:
         stage1_nh = np.mean([r.accuracy for r in stage1_results if r.hateful_expected is False])
         logger.info(f"After Stage 1: Hateful={stage1_h:.3f}, Non-Hateful={stage1_nh:.3f}")
 
-        # ============ Stage 2: HateXplain with Focal Loss ============
-        logger.info("\n--- Stage 2: Fine-tuning with Focal Loss ---")
+        # ============ Stage 2: Add SBIC Hateful Samples ============
+        logger.info("\n--- Stage 2: Add SBIC Hateful Samples ---")
 
-        hx_samples = train_data["hatexplain"]
-        hx_hateful = sum(1 for s in hx_samples if s.label == 1)
-        hx_nonhateful = sum(1 for s in hx_samples if s.label == 0)
-        logger.info(f"Stage 2 samples: {len(hx_samples)} HateXplain, "
-                    f"{hx_hateful} hateful, {hx_nonhateful} non-hateful")
+        # Only use SBIC samples labeled as hateful (implicit hate patterns)
+        sbic_hateful = [s for s in train_data["sbic"] if s.label == 1]
 
-        train_dataset = HateSpeechDataset(hx_samples, tokenizer)
+        # Combine with HateXplain for continued training
+        stage2_samples = hx_samples + sbic_hateful
+        np.random.seed(self.random_seed)
+        np.random.shuffle(stage2_samples)
+
+        stage2_h = sum(1 for s in stage2_samples if s.label == 1)
+        stage2_nh = sum(1 for s in stage2_samples if s.label == 0)
+        logger.info(f"Stage 2 samples: {len(stage2_samples)} total "
+                    f"({len(hx_samples)} HateXplain + {len(sbic_hateful)} SBIC hateful)")
+        logger.info(f"Stage 2 distribution: {stage2_h} hateful, {stage2_nh} non-hateful")
+
+        train_dataset = HateSpeechDataset(stage2_samples, tokenizer)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-        # Asymmetric class weights: heavily favor non-hateful to counteract Stage 1 bias
-        # After Stage 1, model is hateful-biased, so we need to push toward non-hateful
-        # alpha[0] = non-hateful weight, alpha[1] = hateful weight
-        alpha = torch.tensor([2.0, 0.5]).to(self.device)  # 4:1 ratio favoring non-hateful
-        logger.info(f"Focal Loss: gamma={stage2_gamma}, alpha={alpha.tolist()} (asymmetric: 4:1 non-hateful)")
-
-        focal_loss = FocalLoss(alpha=alpha, gamma=stage2_gamma)
-
-        # Lower learning rate for fine-tuning
+        # Very low learning rate to preserve Stage 1 balanced features
         stage2_lr = 1e-5 * stage2_lr_factor
         optimizer = AdamW(model.parameters(), lr=stage2_lr)
         logger.info(f"Stage 2 learning rate: {stage2_lr}")
+
+        # Standard cross-entropy for Stage 2 (not focal loss to avoid over-correction)
+        criterion = torch.nn.CrossEntropyLoss()
 
         for epoch in range(stage2_epochs):
             model.train()
@@ -1350,7 +1357,7 @@ class FunctionalValidationStudy:
                 labels = batch["labels"].to(self.device)
 
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                loss = focal_loss(outputs.logits, labels)
+                loss = criterion(outputs.logits, labels)
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
@@ -1395,7 +1402,8 @@ class FunctionalValidationStudy:
             "hateful_expected": r.hateful_expected,
             "stage1_epochs": stage1_epochs,
             "stage2_epochs": stage2_epochs,
-            "stage2_gamma": stage2_gamma,
+            "stage1_gamma": stage1_gamma,
+            "stage2_lr_factor": stage2_lr_factor,
         } for r in test_results]
 
         df = pd.DataFrame(rows)
