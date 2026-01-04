@@ -46,6 +46,7 @@ from .data import (
     DATA_LIMITATION_TESTS,
 )
 from .data.dataset_loader import Sample
+from .data.sarcasm import ISarcasmLoader
 
 # Delayed imports
 HAS_TORCH = False
@@ -1691,6 +1692,237 @@ class FunctionalValidationStudy:
 
         return df
 
+    def run_sarcasm_sensitivity_study(
+        self,
+        model_type: str = "roberta",
+        num_epochs: int = 3,
+        batch_size: int = 16,
+        n_sarcasm_samples: int = 500,
+    ) -> pd.DataFrame:
+        """
+        Sarcasm Sensitivity Extension Study.
+
+        Evaluates whether hate speech models falsely classify sarcastic content as hateful.
+        Since iSarcasm contains no hateful content, any "hateful" prediction is a false positive.
+
+        Hypothesis: Models trained on implicit hate (SBIC) will exhibit higher false positive
+        rates on sarcasm compared to models trained on explicit hate (HateXplain), because
+        sarcastic content may share linguistic patterns with implicit hate speech.
+
+        Trains two models:
+        1. RoBERTa fine-tuned on HateXplain (explicit hate)
+        2. RoBERTa fine-tuned on SBIC (implicit hate)
+
+        Evaluates both on iSarcasm dataset and reports:
+        - Hateful prediction rate (false positive rate)
+        - Breakdown by sarcasm type if available
+
+        Reference: Oprea and Magdy (2020). iSarcasm: A Dataset of Intended Sarcasm.
+        """
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        from torch.utils.data import DataLoader
+        from torch.optim import AdamW
+
+        logger.info("=" * 60)
+        logger.info("Sarcasm Sensitivity Extension Study")
+        logger.info("=" * 60)
+
+        # Load training data
+        train_data = self.load_training_data()
+
+        # Load iSarcasm dataset
+        logger.info("\nLoading iSarcasm dataset...")
+        isarcasm_loader = ISarcasmLoader(cache_dir=str(self.cache_dir))
+        isarcasm_samples = isarcasm_loader.load()
+
+        # Filter to sarcastic samples only (label=1)
+        sarcastic_samples = [s for s in isarcasm_samples if s.label == 1]
+        logger.info(f"Loaded {len(sarcastic_samples)} sarcastic samples from iSarcasm")
+
+        # Sample if needed
+        if len(sarcastic_samples) > n_sarcasm_samples:
+            np.random.seed(self.random_seed)
+            idx = np.random.choice(len(sarcastic_samples), n_sarcasm_samples, replace=False)
+            sarcastic_samples = [sarcastic_samples[i] for i in idx]
+            logger.info(f"Sampled {n_sarcasm_samples} sarcastic samples for evaluation")
+
+        if not sarcastic_samples:
+            logger.warning("No sarcastic samples found. Returning empty results.")
+            return pd.DataFrame()
+
+        model_path = self.MODELS.get(model_type, model_type)
+        HateSpeechDataset = create_dataset_class()
+
+        results = []
+
+        # ============ Model 1: RoBERTa on HateXplain ============
+        logger.info("\n--- Training Model 1: RoBERTa on HateXplain ---")
+
+        tokenizer_hx = AutoTokenizer.from_pretrained(model_path)
+        model_hx = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=2)
+
+        hx_samples = train_data["hatexplain"]
+        hx_hateful = sum(1 for s in hx_samples if s.label == 1)
+        hx_nonhateful = sum(1 for s in hx_samples if s.label == 0)
+        logger.info(f"Training samples: {len(hx_samples)} ({hx_hateful} hateful, {hx_nonhateful} non-hateful)")
+
+        train_dataset = HateSpeechDataset(hx_samples, tokenizer_hx)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+        model_hx.to(self.device)
+        optimizer = AdamW(model_hx.parameters(), lr=1e-5)
+        criterion = torch.nn.CrossEntropyLoss()
+
+        for epoch in range(num_epochs):
+            model_hx.train()
+            total_loss = 0
+            for batch in train_loader:
+                optimizer.zero_grad()
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
+                outputs = model_hx(input_ids=input_ids, attention_mask=attention_mask)
+                loss = criterion(outputs.logits, labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            logger.info(f"HateXplain Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss / len(train_loader):.4f}")
+
+        # Evaluate on sarcasm
+        model_hx.eval()
+        sarcasm_dataset = HateSpeechDataset(sarcastic_samples, tokenizer_hx)
+        sarcasm_loader = DataLoader(sarcasm_dataset, batch_size=batch_size, shuffle=False)
+
+        hx_preds = []
+        with torch.no_grad():
+            for batch in sarcasm_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                outputs = model_hx(input_ids=input_ids, attention_mask=attention_mask)
+                preds = torch.argmax(outputs.logits, dim=1)
+                hx_preds.extend(preds.cpu().numpy())
+
+        hx_preds = np.array(hx_preds)
+        hx_hateful_preds = int(sum(hx_preds == 1))
+        hx_fpr = hx_hateful_preds / len(hx_preds) * 100
+
+        logger.info(f"\nHateXplain Model on Sarcasm:")
+        logger.info(f"  Predicted hateful: {hx_hateful_preds}/{len(hx_preds)} ({hx_fpr:.1f}%)")
+
+        results.append({
+            "model": "RoBERTa-HateXplain",
+            "train_dataset": "HateXplain",
+            "train_type": "explicit_hate",
+            "n_sarcasm_samples": len(sarcastic_samples),
+            "predicted_hateful": hx_hateful_preds,
+            "predicted_nonhateful": len(hx_preds) - hx_hateful_preds,
+            "hateful_rate_pct": hx_fpr,
+        })
+
+        del model_hx
+        if HAS_TORCH:
+            torch.cuda.empty_cache()
+
+        # ============ Model 2: RoBERTa on SBIC ============
+        logger.info("\n--- Training Model 2: RoBERTa on SBIC ---")
+
+        tokenizer_sbic = AutoTokenizer.from_pretrained(model_path)
+        model_sbic = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=2)
+
+        sbic_samples = train_data["sbic"]
+        sbic_hateful = sum(1 for s in sbic_samples if s.label == 1)
+        sbic_nonhateful = sum(1 for s in sbic_samples if s.label == 0)
+        logger.info(f"Training samples: {len(sbic_samples)} ({sbic_hateful} hateful, {sbic_nonhateful} non-hateful)")
+
+        train_dataset = HateSpeechDataset(sbic_samples, tokenizer_sbic)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+        model_sbic.to(self.device)
+        optimizer = AdamW(model_sbic.parameters(), lr=1e-5)
+        criterion = torch.nn.CrossEntropyLoss()
+
+        for epoch in range(num_epochs):
+            model_sbic.train()
+            total_loss = 0
+            for batch in train_loader:
+                optimizer.zero_grad()
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
+                outputs = model_sbic(input_ids=input_ids, attention_mask=attention_mask)
+                loss = criterion(outputs.logits, labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            logger.info(f"SBIC Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss / len(train_loader):.4f}")
+
+        # Evaluate on sarcasm
+        model_sbic.eval()
+        sarcasm_dataset = HateSpeechDataset(sarcastic_samples, tokenizer_sbic)
+        sarcasm_loader = DataLoader(sarcasm_dataset, batch_size=batch_size, shuffle=False)
+
+        sbic_preds = []
+        with torch.no_grad():
+            for batch in sarcasm_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                outputs = model_sbic(input_ids=input_ids, attention_mask=attention_mask)
+                preds = torch.argmax(outputs.logits, dim=1)
+                sbic_preds.extend(preds.cpu().numpy())
+
+        sbic_preds = np.array(sbic_preds)
+        sbic_hateful_preds = int(sum(sbic_preds == 1))
+        sbic_fpr = sbic_hateful_preds / len(sbic_preds) * 100
+
+        logger.info(f"\nSBIC Model on Sarcasm:")
+        logger.info(f"  Predicted hateful: {sbic_hateful_preds}/{len(sbic_preds)} ({sbic_fpr:.1f}%)")
+
+        results.append({
+            "model": "RoBERTa-SBIC",
+            "train_dataset": "SBIC",
+            "train_type": "implicit_hate",
+            "n_sarcasm_samples": len(sarcastic_samples),
+            "predicted_hateful": sbic_hateful_preds,
+            "predicted_nonhateful": len(sbic_preds) - sbic_hateful_preds,
+            "hateful_rate_pct": sbic_fpr,
+        })
+
+        del model_sbic
+        if HAS_TORCH:
+            torch.cuda.empty_cache()
+
+        # ============ Summary ============
+        logger.info("\n" + "=" * 60)
+        logger.info("Sarcasm Sensitivity Results Summary")
+        logger.info("=" * 60)
+        logger.info(f"\n{'Model':<25} {'Hateful Rate':<15} {'Interpretation'}")
+        logger.info("-" * 60)
+
+        for r in results:
+            model_name = r["model"]
+            rate = r["hateful_rate_pct"]
+            interpretation = "Higher FP" if rate > 30 else "Moderate FP" if rate > 15 else "Lower FP"
+            logger.info(f"{model_name:<25} {rate:>6.1f}%         {interpretation}")
+
+        # Statistical comparison
+        diff = sbic_fpr - hx_fpr
+        logger.info(f"\nDifference (SBIC - HateXplain): {diff:+.1f} pp")
+
+        if diff > 5:
+            logger.info("Finding: SBIC-trained model shows HIGHER false positive rate on sarcasm")
+            logger.info("Interpretation: Implicit hate patterns may overlap with sarcastic language")
+        elif diff < -5:
+            logger.info("Finding: HateXplain-trained model shows HIGHER false positive rate on sarcasm")
+            logger.info("Interpretation: Explicit hate patterns may overlap with sarcastic language")
+        else:
+            logger.info("Finding: Both models show SIMILAR false positive rates on sarcasm")
+            logger.info("Interpretation: No strong evidence of differential sarcasm sensitivity")
+
+        df = pd.DataFrame(results)
+        self._save_results(df, "sarcasm_sensitivity")
+
+        return df
+
     def _evaluate_model(
         self,
         model,
@@ -1963,8 +2195,8 @@ def main():
         help="Training samples per class"
     )
     parser.add_argument(
-        "--phase", type=str, choices=["1", "2", "3", "all"], default="all",
-        help="Which phase to run (1, 2, 3, or all)"
+        "--phase", type=str, choices=["1", "2", "3", "sarcasm", "all"], default="all",
+        help="Which phase to run (1, 2, 3, sarcasm, or all)"
     )
 
     args = parser.parse_args()
@@ -1989,6 +2221,12 @@ def main():
         )
     elif args.phase == "3":
         results = study.run_phase3(
+            model_type=args.models[0],
+            num_epochs=args.epochs,
+            batch_size=args.batch_size,
+        )
+    elif args.phase == "sarcasm":
+        results = study.run_sarcasm_sensitivity_study(
             model_type=args.models[0],
             num_epochs=args.epochs,
             batch_size=args.batch_size,
