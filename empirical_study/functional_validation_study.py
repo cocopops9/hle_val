@@ -46,7 +46,7 @@ from .data import (
     DATA_LIMITATION_TESTS,
 )
 from .data.dataset_loader import Sample
-from .data.sarcasm import ISarcasmLoader
+from .data.sarcasm import ISarcasmLoader, SemEvalSarcasmLoader
 
 # Delayed imports
 HAS_TORCH = False
@@ -1730,24 +1730,39 @@ class FunctionalValidationStudy:
         # Load training data
         train_data = self.load_training_data()
 
-        # Load iSarcasm dataset
-        logger.info("\nLoading iSarcasm dataset...")
-        isarcasm_loader = ISarcasmLoader(cache_dir=str(self.cache_dir))
-        isarcasm_samples = isarcasm_loader.load()
+        # Load sarcasm dataset - try iSarcasm first, fallback to SemEval tweet_eval irony
+        logger.info("\nLoading sarcasm dataset...")
+        sarcastic_samples = []
+        dataset_name = "iSarcasm"
 
-        # Filter to sarcastic samples only (label=1)
-        sarcastic_samples = [s for s in isarcasm_samples if s.label == 1]
-        logger.info(f"Loaded {len(sarcastic_samples)} sarcastic samples from iSarcasm")
+        # Try iSarcasm first
+        try:
+            isarcasm_loader = ISarcasmLoader(cache_dir=str(self.cache_dir))
+            isarcasm_samples = isarcasm_loader.load()
+            sarcastic_samples = [s for s in isarcasm_samples if s.label == 1]
+            if sarcastic_samples:
+                logger.info(f"Loaded {len(sarcastic_samples)} sarcastic samples from iSarcasm")
+        except Exception as e:
+            logger.warning(f"iSarcasm loading failed: {e}")
+
+        # Fallback to SemEval-2018 Task 3 (tweet_eval irony) if iSarcasm empty
+        if not sarcastic_samples:
+            logger.info("Falling back to SemEval-2018 irony dataset (tweet_eval)...")
+            semeval_loader = SemEvalSarcasmLoader(cache_dir=str(self.cache_dir), split="test")
+            semeval_samples = semeval_loader.load()
+            sarcastic_samples = [s for s in semeval_samples if s.label == 1]
+            dataset_name = "SemEval-2018 Irony"
+            logger.info(f"Loaded {len(sarcastic_samples)} ironic samples from SemEval-2018")
 
         # Sample if needed
         if len(sarcastic_samples) > n_sarcasm_samples:
             np.random.seed(self.random_seed)
             idx = np.random.choice(len(sarcastic_samples), n_sarcasm_samples, replace=False)
             sarcastic_samples = [sarcastic_samples[i] for i in idx]
-            logger.info(f"Sampled {n_sarcasm_samples} sarcastic samples for evaluation")
+            logger.info(f"Sampled {n_sarcasm_samples} sarcastic/ironic samples for evaluation")
 
         if not sarcastic_samples:
-            logger.warning("No sarcastic samples found. Returning empty results.")
+            logger.error("No sarcastic samples found from any source. Cannot proceed.")
             return pd.DataFrame()
 
         model_path = self.MODELS.get(model_type, model_type)
@@ -1806,13 +1821,14 @@ class FunctionalValidationStudy:
         hx_hateful_preds = int(sum(hx_preds == 1))
         hx_fpr = hx_hateful_preds / len(hx_preds) * 100
 
-        logger.info(f"\nHateXplain Model on Sarcasm:")
+        logger.info(f"\nHateXplain Model on {dataset_name}:")
         logger.info(f"  Predicted hateful: {hx_hateful_preds}/{len(hx_preds)} ({hx_fpr:.1f}%)")
 
         results.append({
             "model": "RoBERTa-HateXplain",
             "train_dataset": "HateXplain",
             "train_type": "explicit_hate",
+            "eval_dataset": dataset_name,
             "n_sarcasm_samples": len(sarcastic_samples),
             "predicted_hateful": hx_hateful_preds,
             "predicted_nonhateful": len(hx_preds) - hx_hateful_preds,
@@ -1874,13 +1890,14 @@ class FunctionalValidationStudy:
         sbic_hateful_preds = int(sum(sbic_preds == 1))
         sbic_fpr = sbic_hateful_preds / len(sbic_preds) * 100
 
-        logger.info(f"\nSBIC Model on Sarcasm:")
+        logger.info(f"\nSBIC Model on {dataset_name}:")
         logger.info(f"  Predicted hateful: {sbic_hateful_preds}/{len(sbic_preds)} ({sbic_fpr:.1f}%)")
 
         results.append({
             "model": "RoBERTa-SBIC",
             "train_dataset": "SBIC",
             "train_type": "implicit_hate",
+            "eval_dataset": dataset_name,
             "n_sarcasm_samples": len(sarcastic_samples),
             "predicted_hateful": sbic_hateful_preds,
             "predicted_nonhateful": len(sbic_preds) - sbic_hateful_preds,
@@ -1893,7 +1910,7 @@ class FunctionalValidationStudy:
 
         # ============ Summary ============
         logger.info("\n" + "=" * 60)
-        logger.info("Sarcasm Sensitivity Results Summary")
+        logger.info(f"Sarcasm Sensitivity Results Summary ({dataset_name})")
         logger.info("=" * 60)
         logger.info(f"\n{'Model':<25} {'Hateful Rate':<15} {'Interpretation'}")
         logger.info("-" * 60)
